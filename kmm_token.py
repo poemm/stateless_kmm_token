@@ -750,6 +750,9 @@ num_hash_state_bytes = 512
 hash_state_byteidx = 0
 hash_inplace_flag = 0
 def init_hash():
+  global hash_state_byteidx
+  global num_hash_state_bytes
+  global num_hash_block_bytes
   if hash_inplace_flag:
     hash_state_byteidx = malloc(num_hash_state_bytes)
   else:
@@ -758,48 +761,63 @@ def init_hash():
 num_hashblock_bytes = 2*num_hash_bytes+1
 def hash_(dst_byteidx, src_byteidx, len_):
   print("hash(",dst_byteidx, src_byteidx, len_,")")
+  global hash_state_byteidx
+  global num_hash_state_bytes
+  global num_hash_bytes
   if hash_inplace_flag:
     # TODO: hash here
     pass
   else:
     memcpy(hash_state_byteidx+num_hash_state_bytes, src_byteidx, len_)
+    memory[hash_state_byteidx+num_hash_state_bytes] = (memory[hash_state_byteidx+num_hash_state_bytes] + memory[hash_state_byteidx+num_hash_state_bytes+num_hash_bytes])%256
     # TODO: hash here
     memcpy(dst_byteidx, hash_state_byteidx+num_hash_state_bytes, num_hash_bytes)
   print(memory[dst_byteidx:dst_byteidx+num_hash_bytes].hex())
 
+
 def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
-  print(recursion_depth," "*recursion_depth+"merkleize_modifiable_subtree(",node,recursion_depth,")")
+  print(recursion_depth," "*recursion_depth+"merkleize_modifiable_subtree(",hash_block_byteidx,node.startbyteidx,recursion_depth,")")
+  #print()
+  #subtree = Subtree(modified_subtrees_startbyteidx)
+  #print(node.startbyteidx,"subtree with address prefix of length ",subtree.address_prefix_len[0], bytearray(subtree.address_prefix.cast('B')[0:num_address_bytes]).hex())
+  #print_subtree2(subtree.root_byteidx.cast('I')[0],0,0)
+  #print()
   if heap_byteidx < hash_block_byteidx + num_hashblock_bytes:
+    print("GROWING HEAP")
+    print("GROWING HEAP")
+    print("GROWING HEAP")
+    print("GROWING HEAP")
+    print("GROWING HEAP")
     malloc(hash_block_byteidx + num_hashblock_bytes - heap_byteidx)
   memory[hash_block_byteidx:hash_block_byteidx+num_hashblock_bytes] = bytearray([0]*num_hashblock_bytes) # zero workspace
-  if heap_byteidx < hash_block_byteidx + num_hashblock_bytes:
-    hash_block_byteidx = malloc(num_hashblock_bytes)
-  else:
-    # zero out, but maybe this is only needed at end
-    memory[hash_block_byteidx:hash_block_byteidx+num_hashblock_bytes] = bytearray([0]*num_hashblock_bytes)
-  #print(node.leaf_balance_arr)
   print(recursion_depth," "*recursion_depth,node.node_type[0])
   if node.node_type[0]==0b00: # leaf
     memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_address_bytes)
     memcpy(hash_block_byteidx+num_address_bytes, node.right_or_balance_byteidx.cast('I')[0], num_balance_bytes)
-    memcpy(hash_block_byteidx+num_address_bytes+1, node.edge_label_len[0], 1)
+    memory[hash_block_byteidx+num_address_bytes+num_balance_bytes+1] = node.edge_label_len[0]
+    #memcpy(hash_block_byteidx+num_address_bytes+num_balance_bytes+1, node.edge_label_len[0], 1)
+    print("to be hashed",memory[hash_block_byteidx:hash_block_byteidx+num_address_bytes+num_balance_bytes+1].hex())
   elif node.node_type[0] == 0b01:
     memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_balance_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
-    memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
+    #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
   elif node.node_type[0] == 0b10:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
-    memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
-    memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
+    memcpy(hash_block_byteidx+num_hash_bytes, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
+    #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
   elif node.node_type[0] == 0b11:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
+    node_test = Tree_node(node.right_or_balance_byteidx.cast('I')[0])
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_balance_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
-    memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-  print(recursion_depth," "*recursion_depth,"hashing")
+    #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
+  #print(recursion_depth," "*recursion_depth,"hashing")
   hash_(hash_block_byteidx, hash_block_byteidx, num_hashblock_bytes)
 
 
@@ -1065,7 +1083,6 @@ def main(calldata,arg_state_root):
   if debug:
     print()
     print("4) Merkleize pre and post root")
-  print("4) Merkleize pre and post root")
   hash_block_byteidx = malloc(2*num_hashblock_bytes)
   init_merkleization_and_merkleize(hash_block_byteidx)
 
