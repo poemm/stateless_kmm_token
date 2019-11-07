@@ -16,7 +16,16 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-debug = 1
+
+"""
+TODO:
+ - investigate leaving edge labels in-place, and just zero before and after, avoids bitshifting
+ - investiage edge labels having 0-255 values, since need 0-256
+ - nonce with balance
+ - signature verificatoin
+"""
+
+debug = 0
 
 ##############
 # some globals
@@ -48,6 +57,8 @@ num_message_bits = num_message_bytes*8
 # transactions: 
 num_transaction_bytes=1+1+num_signature_bytes+num_address_bytes+num_balance_bytes
 num_transaction_bits=num_transaction_bytes*8
+# modified subtree idxs
+num_modified_subtree_idxs_bytes = 11
 
 
 # CALLDATA INFO
@@ -90,7 +101,7 @@ account_idx = 0
 # bit twiddling
 
 def get_bits_big_endian(dst, src, start_bit_idx, len_):
-  print("\nget_bits_big_endian(",dst,",","src",",",start_bit_idx,",",len_,")")
+  #print("\nget_bits_big_endian(",dst,",","src",",",start_bit_idx,",",len_,")")
   # todo: assertions that start_bit_idx <= end_bit_idx and they are within src and dst
   # set up output bytes and indices
   num_output_bytes = (len_+7)//8 #(end_bit_idx-start_bit_idx+1+7)//8
@@ -133,6 +144,17 @@ def get_bits_big_endian(dst, src, start_bit_idx, len_):
   #print("  ","input",bytearray(src[:]).hex())
   #print("  ","output",bytearray(dst[:num_output_bytes]).hex())
   return dst
+
+def getbit(byteidx,bitidx):
+  byte = memory[byteidx+bitidx//8]
+  bit = (byte<<(bitidx%8))>>7
+  return bit
+
+def bitcompare(byteidx1, byteidx2, startbitidx, len_):
+  for idx in range(startbitidx,startbitidx+len_):
+    if getbit(byteidx1,idx) != getbit(byteidx2,idx):
+      return idx
+  return startbitidx+len_
 
 ######################################
 # memory management, to make it like C
@@ -273,7 +295,7 @@ def get_next_modified_subtree_node_label_idx():
     next_modified_subtree_node_label_idx = 0
   else:
     next_modified_subtree_node_label_idx = int.from_bytes(memory[modified_subtree_idxs_byteidx:modified_subtree_idxs_byteidx+2], byteorder="little")
-    modified_subtree_idxs_byteidx += num_subtree_bytes
+    modified_subtree_idxs_byteidx += num_modified_subtree_idxs_bytes
 
 def get_next_account_idx():
   # this is used to build subtree
@@ -335,7 +357,7 @@ tn = Tree_node._make(struct.unpack('iiiiiccc20s', packed))
 
 
 # tree node
-num_treenode_bytes = 15+num_address_bytes
+num_treenode_bytes = 28
 class Tree_node:
   # instantiate with TreeNode(malloc(num_treenode_bytes))
   """
@@ -347,39 +369,24 @@ class Tree_node:
     self.startbyteidx = startbyteidx
     self.mv = memoryview(memory)
 
-    # parent and children
+    # parent+children/hash/address+data
     self.parent_byteidx                 = self.mv[self.startbyteidx:self.startbyteidx+4]
     self.left_or_address_byteidx        = self.mv[self.startbyteidx+4:self.startbyteidx+8]
     self.right_or_balance_byteidx       = self.mv[self.startbyteidx+8:self.startbyteidx+12]
-    #self.lefthash_idx = None
-    #self.righthash_idx = None
-    # leaf stuff
-    #self.leaf_address_byteidx           = self.mv[self.startbyteidx+12:self.startbyteidx+16]
-    #self.leaf_balance_byteidx           = self.mv[self.startbyteidx+16:self.startbyteidx+20]
-    # node type and edge label
+    # node type
     self.node_type                      = self.mv[self.startbyteidx+12:self.startbyteidx+13]  # 0b00: leaf, 0b01: interior with only right child, 0b10: interior with only left child, 0b11: interior with both children
-    self.edge_label_len                 = self.mv[self.startbyteidx+13:self.startbyteidx+14]
-    self.edge_label_len_total           = self.mv[self.startbyteidx+14:self.startbyteidx+15]
-    self.edge_label                     = self.mv[self.startbyteidx+15:self.startbyteidx+15+num_address_bytes]
+    # edge label
+    self.edge_label_byteidx             = self.mv[self.startbyteidx+16:self.startbyteidx+20]
+    self.edge_label_len                 = self.mv[self.startbyteidx+20:self.startbyteidx+24]
+    self.edge_label_startbitidx           = self.mv[self.startbyteidx+24:self.startbyteidx+28]
 
 
-# subtree node
-num_subtree_bytes = 5+num_address_bytes
-class Subtree:
-  def __init__(self, startbyteidx):
-    # raw bytes
-    self.startbyteidx = startbyteidx
-    self.mv = memoryview(memory)
-
-    self.root_byteidx           = self.mv[startbyteidx:startbyteidx+4]
-    self.address_prefix_len     = self.mv[startbyteidx+4:startbyteidx+5]
-    self.address_prefix         = self.mv[startbyteidx+5:startbyteidx+5+num_address_bytes]
 
 
 
 debug_build_idx = 0
-def build_tree_from_node_labels(edge_label_len_total, node):
-  print("\nbuild_tree_from_node_labels(",edge_label_len_total,")")
+def build_tree_from_node_labels(edge_label_startbitidx, node):
+  print("\n\n\nbuild_tree_from_node_labels(",edge_label_startbitidx,")")
   global num_address_bits
   global addresses_byteidx
   global num_address_bytes
@@ -387,37 +394,36 @@ def build_tree_from_node_labels(edge_label_len_total, node):
   if debug:
     global debug_build_idx
     debug_build_idx+=1
-    print("  ",debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")")
+    #print("  ",debug_build_idx,"build_tree_from_node_labels(",edge_label_startbitidx,")")
+  node.edge_label_len.cast('I')[0] = 0
+  node.edge_label_startbitidx.cast('I')[0] = edge_label_startbitidx
+  node.edge_label_byteidx.cast('I')[0] = addresses_byteidx
   # get node label
   node_label = get_next_node_label_bitpair()
   if debug: print(debug_build_idx,"build_tree_from_node_labels()","node_label",node_label)
   # todo: assert we are within bound of label length, etc
   if node_label == 0b00:
     # either we are already at a leaf, or there is an edge label
-    if edge_label_len_total == num_address_bits-1: # a leaf without an edge label, this is unlikely
+    if edge_label_startbitidx == num_address_bits-1: # a leaf without an edge label, this is unlikely
       node.left_or_address_byteidx.cast('I')[0] = get_next_address_byteidx() 
       node.right_or_balance_byteidx.cast('I')[0] = get_next_postbalance_byteidx()
       node.node_type[0] = 0b00
-      self.edge_label_len[0] = 0
-      node.edge_label_len_total[0] = edge_label_len_total
-      node.edge_label[:] = bytearray([0]*num_address_bytes)
+      node.edge_label_byteidx.cast('I')[0] = node.left_or_address_byteidx.cast('I')[0]
       return
     else:
       # there is an edge label, get it
-      print()
-      print()
-      print("there is an edge label, get it")
-      node.edge_label_len[0] = get_next_edge_label_length()
-      get_bits_big_endian(node.edge_label, memory, 8*addresses_byteidx+edge_label_len_total, node.edge_label_len[0])
-      edge_label_len_total += node.edge_label_len[0]
-      node.edge_label_len_total[0] = edge_label_len_total
-      print("edge_label_len, edge_label_len_total",node.edge_label_len[0],node.edge_label_len_total[0], edge_label_len_total)
+      print("there is an edge label len, get it")
+      edge_label_len = get_next_edge_label_length()
+      if edge_label_len == 0:
+        edge_label_len = 256
+      # TODO: above can lead to overflow here, especially since 256 is a possible value for singleton tree, but that should be taken care of in the above case
+      node.edge_label_len.cast('I')[0] = edge_label_len
+      print("edge_label_len, edge_label_startbitidx,edge_label_len",node.edge_label_len.cast('I')[0],node.edge_label_startbitidx.cast('I')[0], edge_label_len)
       print("addresses_byteidx",addresses_byteidx)
       # either leaf or not leaf
-      if debug: print("if leaf then true: ",node.edge_label_len_total[0] == num_address_bits-1, node.edge_label_len_total[0], num_address_bits-1)
-      if node.edge_label_len_total[0] == num_address_bits-1:
-        if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","found leaf")
-        node.edge_label_len_total[0] = edge_label_len_total
+      if debug: print("if leaf then true: ",node.edge_label_startbitidx.cast('I')[0] == num_address_bits-1, node.edge_label_startbitidx.cast('I')[0], num_address_bits-1)
+      if node.edge_label_startbitidx.cast('I')[0] + node.edge_label_len.cast('I')[0] == num_address_bits-1:
+        if debug: print(debug_build_idx,"build_tree_from_node_labels(",node.edge_label_startbitidx.cast('I')[0],")","found leaf")
         node.left_or_address_byteidx.cast('I')[0] = get_next_address_byteidx()
         node.right_or_balance_byteidx.cast('I')[0] = get_next_postbalance_byteidx()
         node.node_type[0] = 0b00
@@ -425,30 +431,29 @@ def build_tree_from_node_labels(edge_label_len_total, node):
       else:
         # not a leaf, get next node label and process it below
         node_label = get_next_node_label_bitpair()
-        if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","node_label after 00",node_label)
+        if debug: print(debug_build_idx,"build_tree_from_node_labels(",node.edge_label_startbitidx.cast('I')[0],")","node_label after 00",node_label)
   # this is an internal node, we already got the edge label if there was one
-  print("ok",node.edge_label_len_total[0], edge_label_len_total)
-  node.edge_label_len_total[0] = edge_label_len_total
+  print("ok",node.edge_label_startbitidx.cast('I')[0])
   node.node_type[0] = node_label
   if node_label == 0b11:
     # recurse left and right
     left_subtree = Tree_node(malloc(num_treenode_bytes))
     left_subtree.parent_byteidx.cast('I')[0] = node.startbyteidx
     node.left_or_address_byteidx.cast('I')[0] = left_subtree.startbyteidx
-    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","recursing left")
-    build_tree_from_node_labels(edge_label_len_total+1, left_subtree)
+    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_startbitidx,")","recursing left")
+    build_tree_from_node_labels(node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]+1, left_subtree)
     right_subtree = Tree_node(malloc(num_treenode_bytes))
     right_subtree.parent_byteidx.cast('I')[0] = node.startbyteidx
     node.right_or_balance_byteidx.cast('I')[0] = right_subtree.startbyteidx
-    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","recursing right")
-    build_tree_from_node_labels(edge_label_len_total+1, right_subtree)
+    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_startbitidx,")","recursing right")
+    build_tree_from_node_labels(node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]+1, right_subtree)
   elif node_label == 0b10:
     # recurse left, get hash for right
     left_subtree = Tree_node(malloc(num_treenode_bytes))
     left_subtree.parent_byteidx.cast('I')[0] = node.startbyteidx
     node.left_or_address_byteidx.cast('I')[0] = left_subtree.startbyteidx
-    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","recursing left")
-    build_tree_from_node_labels(edge_label_len_total+1, left_subtree)
+    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_startbitidx,")","recursing left")
+    build_tree_from_node_labels(node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]+1, left_subtree)
     node.right_or_balance_byteidx.cast('I')[0] = get_next_hash_byteidx()
   elif node_label == 0b01:
     # get hash for left, recurse right
@@ -456,8 +461,8 @@ def build_tree_from_node_labels(edge_label_len_total, node):
     right_subtree = Tree_node(malloc(num_treenode_bytes))
     right_subtree.parent_byteidx.cast('I')[0] = node.startbyteidx
     node.right_or_balance_byteidx.cast('I')[0] = right_subtree.startbyteidx
-    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_len_total,")","recursing right")
-    build_tree_from_node_labels(edge_label_len_total+1, right_subtree)
+    if debug: print(debug_build_idx,"build_tree_from_node_labels(",edge_label_startbitidx,")","recursing right")
+    build_tree_from_node_labels(node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]+1, right_subtree)
 
 
 # build each subtree, put them in a global array
@@ -466,7 +471,7 @@ def build_modified_subtrees():
   print("build_modified_subtrees()")
   global modified_subtrees
   global modified_subtrees_startbyteidx
-  modified_subtrees_startbyteidx = malloc(num_modified_subtrees*num_subtree_bytes)
+  modified_subtrees_startbyteidx = malloc(num_modified_subtrees*num_treenode_bytes)
   modified_subtrees_byteidx = modified_subtrees_startbyteidx
   global modified_subtree_idxs_bytelen
   global node_labels_idx
@@ -486,23 +491,16 @@ def build_modified_subtrees():
     account_idx               = int.from_bytes(memory[modified_subtree_idxs_byteidx+8:modified_subtree_idxs_byteidx+10], byteorder="little")
     addresses_idx, postbalances_idx = account_idx, account_idx
     addresses_byteidx = addresses_startbyteidx+addresses_idx*num_address_bytes
-    edge_label_len_total     = int.from_bytes(memory[modified_subtree_idxs_byteidx+10:modified_subtree_idxs_byteidx+11], byteorder="little")
-    print("build_modified_subtrees() iter  node_labels_idx",node_labels_idx,"edge_labels_lengths_idx",edge_label_lengths_idx,"edge_labels_idx",edge_labels_idx,"hashes_idx",hashes_idx,"account_idx",account_idx,"edge_label_len_total",edge_label_len_total)
+    address_prefix_bitidx     = int.from_bytes(memory[modified_subtree_idxs_byteidx+10:modified_subtree_idxs_byteidx+11], byteorder="little")
+    if debug: print("build_modified_subtrees() iter  node_labels_idx",node_labels_idx,"edge_labels_lengths_idx",edge_label_lengths_idx,"edge_labels_idx",edge_labels_idx,"hashes_idx",hashes_idx,"account_idx",account_idx,"address_prefix_bitidx",address_prefix_bitidx)
     modified_subtree_idxs_byteidx += 11
     # create new node
-    subtree_root_byteidx = malloc(num_treenode_bytes)
+    subtree_root_byteidx = modified_subtrees_byteidx
     subtree_root_node = Tree_node(subtree_root_byteidx)
-    # encapsulate subtree in structure to maintain its edge label prefix
-    subtree = Subtree(modified_subtrees_byteidx)
-    subtree.root_byteidx.cast('I')[0] = subtree_root_byteidx
-    subtree.address_prefix_len[0]     = edge_label_len_total
-    get_bits_big_endian(subtree.address_prefix, memory, 8*addresses_byteidx, edge_label_len_total)
-    #print(subtree.address_prefix.cast('B')[0], edge_label_len_total)
     # build subtree of nodes
-    #print("building subtree with subtree.startbyteidx",subtree.startbyteidx)
-    build_tree_from_node_labels(edge_label_len_total, subtree_root_node)
+    build_tree_from_node_labels(address_prefix_bitidx, subtree_root_node)
     # iterate
-    modified_subtrees_byteidx += num_subtree_bytes
+    modified_subtrees_byteidx += num_treenode_bytes
 
 
 
@@ -517,78 +515,66 @@ def build_modified_subtrees():
 # 3) process transactions 
 
 def find_account_or_neighbor_or_error(node,address_byteidx):
-  print("find_account_or_neighbor_or_error(",node,address_byteidx,")")
+  if debug: print("find_account_or_neighbor_or_error(", node.startbyteidx if node else node, address_byteidx,")")
   if node==None:
     return None, ""
-  label_len = node.edge_label_len[0]
-  label_endbitidx = node.edge_label_len_total[0]
-  label_startbitidx = label_endbitidx-label_len
   # if has edge label
-  if label_len>0:
+  if node.edge_label_len.cast('I')[0]>0:
     #print("have edge label")
+    # TODO: do we need to check against neighbor up to this point. Don't think so, since checked up to root of subtree, then checked each label, and left/right corresponded to 0/1. So no need I think.
     # check edge label against corresponding bits in address from signature
-    corresponding_bits = bytearray([0]*((label_len+7)//8))
-    get_bits_big_endian(corresponding_bits, memory, 8*address_byteidx+label_endbitidx-label_len, label_len)
-    print(node.edge_label,corresponding_bits)
-    if node.edge_label[:(label_len+7)//8] != corresponding_bits:
-      # TODO: do we need to check against neighbor up to this point. Don't think so, since checked up to root of subtree, then checked each label, and left/right corresponded to 0/1. So no need I think.
+    if bitcompare(address_byteidx, node.edge_label_byteidx.cast('I')[0], node.edge_label_startbitidx.cast('I')[0], node.edge_label_len.cast('I')[0]) != node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]:
       return node.startbyteidx, "neighbor" # leaf not present, but have neighbor
+    #corresponding_bits = bytearray([0]*((label_len+7)//8))
+    #get_bits_big_endian(corresponding_bits, memory, 8*address_byteidx+label_endbitidx-label_len, label_len)
+    #print(node.edge_label,corresponding_bits)
+    #if node.edge_label[:(label_len+7)//8] != corresponding_bits:
+    #  return node.startbyteidx, "neighbor" # leaf not present, but have neighbor
   # if leaf
   if node.node_type[0] == 0b00: # leaf; or, equivalently, label_endbitidx==num_address_bits-1
-    # TODO: hmm, maybe don't think that I have to compare leaf address to sig address, since couldn't get this far otherwise
+    # TODO: do we have to confirm leaf address matches sig address? maybe don't think that I have to compare leaf address to sig address, since couldn't get this far otherwise
     return node.startbyteidx, "account"
-    # confirm that address at leaf matches address from signature
-    #leaf_address_from_node = memory[node.leaf_address_byteidx:node.leaf_address_byteidx+num_address_bytes]
-    #leaf_address_from_sig = memory[address_byteidx:address_byteidx+num_address_bytes]
-    #if leaf_address_from_node == leaf_address_from_sig:
-    #  #print("found account")
-    #  return node, "account"
-    #else:
-    #  #print("found neighbor")
-    #  return node, "neighbor"
+  # TODO: what if find hash as left or right child, should check
   # recurse left/right based on next bit
-  nextbit = bytearray([0])
-  get_bits_big_endian(nextbit, memory, address_byteidx+8*label_endbitidx+1,1) #print("nextbit",nextbit)
-  if nextbit == bytearray([0]):
-    #print("recurse left",nextbit)
+  nextbit = getbit(address_byteidx,node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0])
+  #print("nextbit",nextbit)
+  #nextbit = bytearray([0])
+  #get_bits_big_endian(nextbit, memory, address_byteidx*8+label_endbitidx,1)
+  #print("nextbit",nextbit,"address_byteidx,label_endbitidx",address_byteidx,label_endbitidx)
+  if nextbit == 0:
+    if node.node_type[0] == 0b01:
+      if debug: print("error, can't recurse left into hash")
+      return None, ""
+    if debug: print("recurse left",nextbit)
     return find_account_or_neighbor_or_error(Tree_node(node.left_or_address_byteidx.cast('I')[0]), address_byteidx)
   else:
-    #print("recurse right",nextbit)
+    if node.node_type[0] == 0b10:
+      if debug: print("error, can't recurse right into hash", node.node_type[0])
+      return None, ""
+    if debug: print("recurse right",nextbit)
     return find_account_or_neighbor_or_error(Tree_node(node.right_or_balance_byteidx.cast('I')[0]), address_byteidx)
 
 
-def insert_leaf(neighbor,address_byteidx,balance=0):
-  print("insert_leaf(",neighbor,",",address_byteidx,")")
+def insert_leaf(neighbor,address_byteidx,balance):
+  print("insert_leaf(",neighbor.startbyteidx if neighbor else neighbor,",",address_byteidx,")")
   # if tree is empty, insert this address and balance and return
-  # TODO: don't think there should be this possibility, since edge label lengths are unknown, so can't insert first node
+  # TODO: don't think there should be this possibility, since edge label lengths are unknown, so can't insert first node, but leave it for test generation
   if neighbor == None:
     new_leaf_byteidx = malloc(num_treenode_bytes)
     new_leaf = Tree_node(new_leaf_byteidx)
     new_leaf.node_type[0] = 0b00
-    address_byteidx = malloc(num_address_bytes)
+    #address_byteidx = malloc(num_address_bytes)
     balance_byteidx = malloc(num_balance_bytes)
     new_leaf.left_or_address_byteidx.cast('I')[0] = address_byteidx
     new_leaf.right_or_balance_byteidx.cast('I')[0] = balance_byteidx
-    new_leaf.edge_label_len[0] = num_address_bits - neighbor.edge_label_len_total[0] - neighbor.edge_label_len[0]
-    new_leaf.edge_label_len_total[0] = num_address_bits - 1
-    new_leaf.edge_label[0:num_address_bytes] = memory[address_byteidx:address_byteidx+num_address_bytes]
+    new_leaf.edge_label_startbitidx.cast('I')[0] = 0
+    new_leaf.edge_label_len.cast('I')[0] = num_address_bits
+    new_leaf.edge_label_byteidx.cast('I')[0] = address_byteidx
     return new_leaf
   # get bit where address and edge_label diverge
-  #print("neighbor.edge_label_len",neighbor.edge_label_len)
-  #print_node(neighbor,10)
-  i=0
-  while i < neighbor.edge_label_len[0]:
-    print("i",i)
-    bit_idx = neighbor.edge_label_len_total[0]-neighbor.edge_label_len[0]+i
-    addybit = bytearray([0])
-    get_bits_big_endian(addybit, memory, 8*address_byteidx + bit_idx,1)
-    edge_label_bit = bytearray([0])
-    get_bits_big_endian(edge_label_bit, neighbor.edge_label, i, 1)
-    print(addybit,edge_label_bit)
-    if addybit != edge_label_bit:
-      break
-    i+=1
-  print("final i",i)
+  i = bitcompare(address_byteidx, neighbor.edge_label_byteidx.cast('I')[0], neighbor.edge_label_startbitidx.cast('I')[0], neighbor.edge_label_len.cast('I')[0])
+  addybit = getbit(address_byteidx,i)
+  print("i",i)
   # insert node
   new_interior_node = Tree_node(malloc(num_treenode_bytes))
   new_interior_node.node_type[0] = 0b11
@@ -596,26 +582,21 @@ def insert_leaf(neighbor,address_byteidx,balance=0):
   new_leaf.node_type[0] = 0b00
   new_leaf.left_or_address_byteidx.cast('I')[0] = address_byteidx
   new_leaf.right_or_balance_byteidx.cast('I')[0] = malloc(num_balance_bytes)
-  print("new_interior_node and new_leaf", new_interior_node.startbyteidx, new_leaf.startbyteidx)
+  #print("new_interior_node and new_leaf", new_interior_node.startbyteidx, new_leaf.startbyteidx)
   # first take care of edge labels and lengths
-  new_interior_node.edge_label_len[0] = i
-  new_interior_node.edge_label_len_total[0] = neighbor.edge_label_len_total[0] - neighbor.edge_label_len[0] + i
-  print("new_interior_node.edge_label_len_total",new_interior_node.edge_label_len_total[0])
-  if new_interior_node.edge_label_len[0]:
-    print("ok1")
-    label_startidx = neighbor.edge_label_len_total[0]-neighbor.edge_label_len[0]
-    label_len = new_interior_node.edge_label_len[0]
-    get_bits_big_endian(new_interior_node.edge_label, memory, 8*address_byteidx + label_startidx, label_len)
-  print("ok3")
-  new_leaf.edge_label_len[0] = num_address_bits - new_interior_node.edge_label_len_total[0]-1
-  new_leaf.edge_label_len_total[0] = num_address_bits-1
-  get_bits_big_endian(new_leaf.edge_label, memory, 8*address_byteidx + new_interior_node.edge_label_len_total[0], num_address_bits-new_interior_node.edge_label_len_total[0])
-  neighbor.edge_label_len[0] -= i+1
-  if neighbor.edge_label_len[0] != 0:
-    print("ok5")
-    #neighbor.edge_label = get_bits_big_endian(neighbor.edge_label,i+1,i+1+neighbor.edge_label_len)
-    label_startidx = neighbor.edge_label_len_total-neighbor.edge_label_len+i-1
-    get_bits_big_endian(neighbor.edge_label, memory, label_startidx, neighbor.edge_label_len[0])
+  new_interior_node.edge_label_startbitidx.cast('I')[0] = neighbor.edge_label_startbitidx.cast('I')[0]
+  new_interior_node.edge_label_len.cast('I')[0] = i-neighbor.edge_label_startbitidx.cast('I')[0]
+  new_interior_node.edge_label_byteidx.cast('I')[0] = address_byteidx
+  #print("new_interior_node.edge_label_endbitidx",new_interior_node.edge_label_endbitidx[0])
+  new_leaf.edge_label_startbitidx.cast('I')[0] = i+1
+  new_leaf.edge_label_len.cast('I')[0] = num_address_bits-(i+1)
+  new_leaf.edge_label_byteidx.cast('I')[0] = address_byteidx
+  neighbor.edge_label_len.cast('I')[0] -= i+1-neighbor.edge_label_startbitidx.cast('I')[0]
+  neighbor.edge_label_startbitidx.cast('I')[0] = i+1
+  #print()
+  #print()
+  #print()
+  #print("0kdokie",i,neighbor.edge_label_startbitidx.cast('I')[0],neighbor.edge_label_len.cast('I')[0])
   # adjust parent and children pointers
   new_leaf.parent_byteidx.cast('I')[0] = new_interior_node.startbyteidx
   new_interior_node.parent_byteidx.cast('I')[0] = neighbor.parent_byteidx.cast('I')[0]
@@ -626,10 +607,10 @@ def insert_leaf(neighbor,address_byteidx,balance=0):
     else:
       parent.right_or_balance_byteidx.cast('I')[0] = new_interior_node.startbyteidx
   neighbor.parent_byteidx.cast('I')[0] = new_interior_node.startbyteidx
-  print("new interior node has left and right children:")
+  #print("new interior node has left and right children:")
   # two cases: diverge left or right
   #print("ok",addybit,new_interior_node)
-  if addybit==bytearray(b'\x00'): # diverge right
+  if addybit==0: # diverge right
     new_interior_node.right_or_balance_byteidx.cast('I')[0] = neighbor.startbyteidx
     new_interior_node.left_or_address_byteidx.cast('I')[0] = new_leaf.startbyteidx
   else: # diverge left
@@ -696,28 +677,11 @@ def process_transactions():
     elif to_idx < num_balances + num_modified_subtrees:
       # traverse tree until leaf, possibly inserting a new leaf
       print("must traverse tree.   to_idx>=num_orignal_accounts", to_idx, num_original_accounts)
-      subtree = Subtree(modified_subtrees_startbyteidx + num_subtree_bytes*(to_idx-num_original_accounts))
-      node = Tree_node(subtree.root_byteidx.cast('I')[0])
-      print("subtree",subtree.startbyteidx,"node",node.startbyteidx)
+      node = Tree_node(modified_subtrees_startbyteidx + num_treenode_bytes*(to_idx-num_original_accounts))
+      print("node",node.startbyteidx)
       # check subtree address prefix against to address prefix
-      label_len = node.edge_label_len[0]
-      label_endbitidx = node.edge_label_len_total[0]
-      label_startbitidx = label_endbitidx-label_len
-      to_bytes = memory[to_address_byteidx:to_address_byteidx+label_endbitidx//8]
-      subtree_bytes = subtree.address_prefix[0:label_endbitidx//8]
-      #bytes2 = uemory[subtree.address_prefix_byteidx.cast('I')[0]:subtree.address_prefix_byteidx.cast('I')[0]+(label_endbitidx+7)//8]
-      print("0k")
-      print(to_bytes,subtree_bytes)
-      if to_bytes != subtree_bytes:
+      if bitcompare(node.edge_label_byteidx.cast('I')[0], to_address_byteidx, node.edge_label_startbitidx.cast('I')[0], node.edge_label_len.cast('I')[0]) != node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]:
         print("error address prefix not equal")
-        return None, "" # error
-      to_lastbyte = bytearray([0])
-      get_bits_big_endian(to_lastbyte, memory, 8*(to_address_byteidx+label_endbitidx//8), label_endbitidx%8)
-      #get_bits_big_endian(lastbyte2, 8*(subtree.address_prefix_byteidx.cast('I')[0]+label_endbitidx//8), label_endbitidx%8)
-      subtree_lastbyte = bytearray([subtree.address_prefix[label_endbitidx//8]])
-      print(to_lastbyte,subtree_lastbyte)
-      if to_lastbyte != subtree_lastbyte:
-        print("error address prefix not equal at last byte")
         return None, "" # error
       # find leaf for this account or the neighbor which it branches from if there is a new node
       node_account_or_neighbor_byteidx,err = find_account_or_neighbor_or_error(node,to_address_byteidx)
@@ -725,7 +689,7 @@ def process_transactions():
       # if not a leaf, must insert leaf
       account = Tree_node(node_account_or_neighbor_byteidx)
       if err=="neighbor":
-        account = insert_leaf(account,to_address_byteidx)
+        account = insert_leaf(account,to_address_byteidx,0)
       to_data_byteidx = account.right_or_balance_byteidx.cast('I')[0]
     else:
       print("error, to_idx is too large")
@@ -780,7 +744,7 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
   #print()
   #subtree = Subtree(modified_subtrees_startbyteidx)
   #print(node.startbyteidx,"subtree with address prefix of length ",subtree.address_prefix_len[0], bytearray(subtree.address_prefix.cast('B')[0:num_address_bytes]).hex())
-  #print_subtree2(subtree.root_byteidx.cast('I')[0],0,0)
+  #print_subtree(subtree.root_byteidx.cast('I')[0],0,0)
   #print()
   if heap_byteidx < hash_block_byteidx + num_hashblock_bytes:
     print("GROWING HEAP")
@@ -794,7 +758,7 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
   if node.node_type[0]==0b00: # leaf
     memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_address_bytes)
     memcpy(hash_block_byteidx+num_address_bytes, node.right_or_balance_byteidx.cast('I')[0], num_balance_bytes)
-    memory[hash_block_byteidx+num_address_bytes+num_balance_bytes+1] = node.edge_label_len[0]
+    memory[hash_block_byteidx+num_address_bytes+num_balance_bytes+1] = node.edge_label_len.cast('I')[0]
     #memcpy(hash_block_byteidx+num_address_bytes+num_balance_bytes+1, node.edge_label_len[0], 1)
     print("to be hashed",memory[hash_block_byteidx:hash_block_byteidx+num_address_bytes+num_balance_bytes+1].hex())
   elif node.node_type[0] == 0b01:
@@ -802,13 +766,14 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_balance_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
   elif node.node_type[0] == 0b10:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
     memcpy(hash_block_byteidx+num_hash_bytes, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
+    print("ok",node.edge_label_startbitidx.cast('I')[0], node.edge_label_len.cast('I')[0])
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
   elif node.node_type[0] == 0b11:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
@@ -816,7 +781,7 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_balance_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len[0]
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
   #print(recursion_depth," "*recursion_depth,"hashing")
   hash_(hash_block_byteidx, hash_block_byteidx, num_hashblock_bytes)
 
@@ -836,8 +801,7 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
   #print(recursion_depth," "*recursion_depth+"node_labels_idx",node_labels_idx,"next_modifiable_subtree_node_label_idx",next_modified_subtree_node_label_idx)
   if node_labels_idx == next_modified_subtree_node_label_idx:
     post_hash_flag = 0
-    subtree = Subtree(modified_subtrees_startbyteidx + modifiable_subtree_idx*num_subtree_bytes)
-    node = Tree_node(subtree.root_byteidx.cast('I')[0])
+    node = Tree_node(modified_subtrees_startbyteidx + modifiable_subtree_idx*num_treenode_bytes)
     print(recursion_depth," "*recursion_depth+"merklizing modifiable_subtree")
     print()
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, node, recursion_depth)
@@ -1039,11 +1003,11 @@ def main(calldata,arg_state_root):
     print("printing subtrees")
     modified_subtrees_byteidx = modified_subtrees_startbyteidx
     for i in range(num_modified_subtrees):
-      subtree = Subtree(modified_subtrees_byteidx)
+      node = Tree_node(modified_subtrees_byteidx)
       print()
-      print("subtree with address prefix of length ",subtree.address_prefix_len[0], bytearray(subtree.address_prefix.cast('B')[0:num_address_bytes]).hex())
-      print_subtree2(subtree.root_byteidx.cast('I')[0],0,0)
-      modified_subtrees_byteidx += num_subtree_bytes
+      print("subtree with address prefix of length ",node.edge_label_len.cast('I')[0], memory[node.edge_label_byteidx.cast('I')[0]:node.edge_label_byteidx.cast('I')[0]+num_address_bytes].hex())
+      print_subtree(node.startbyteidx,0,0)
+      modified_subtrees_byteidx += num_treenode_bytes
 
 
   # 3) process transactions 
@@ -1059,11 +1023,11 @@ def main(calldata,arg_state_root):
     print("printing subtrees")
     modified_subtrees_byteidx = modified_subtrees_startbyteidx
     for i in range(num_modified_subtrees):
-      subtree = Subtree(modified_subtrees_byteidx)
+      node = Tree_node(modified_subtrees_byteidx)
       print()
-      print("subtree with address prefix of length ",subtree.address_prefix_len[0], bytearray(subtree.address_prefix.cast('B')[0:num_address_bytes]).hex())
-      print_subtree2(subtree.root_byteidx.cast('I')[0],0,0)
-      modified_subtrees_byteidx += num_subtree_bytes
+      print("subtree with address prefix of length ",node.edge_label_startbitidx.cast('I')[0], memory[node.edge_label_byteidx.cast('I')[0]:node.edge_label_byteidx.cast('I')[0]+num_address_bytes].hex())
+      print_subtree(node.startbyteidx,0,0)
+      modified_subtrees_byteidx += num_treenode_bytes
     # print prebalances
     print()
     print("prebalances")
@@ -1086,7 +1050,9 @@ def main(calldata,arg_state_root):
   hash_block_byteidx = malloc(2*num_hashblock_bytes)
   init_merkleization_and_merkleize(hash_block_byteidx)
 
-  return None,None
+  print("preroot:",memory[hash_block_byteidx:hash_block_byteidx+num_hash_bytes].hex())
+  print("postroot:",memory[hash_block_byteidx+num_hash_bytes:hash_block_byteidx+2*num_hash_bytes].hex())
+
   """
   # 5) check if computed_old_root equas old_root
   if debug:
@@ -1141,45 +1107,20 @@ def bytes2bin(bytes_):
 
 print_idx = 0
 
+def bytearray_to_hex(memory,startbyteidx,len_):
+  return memory[startbyteidx:startbyteidx+len_].hex()
+
 def print_node(node,indent):
-  global print_idx
-  print(" "*indent,print_idx,"node:",node)
-  print(" "*indent,print_idx,"node_type:",node.node_type)
-  print(" "*indent,print_idx,"edge_label_len:",node.edge_label_len,"edge_label:",node.edge_label.hex(),"edge_label_len_total:",node.edge_label_len_total)
-  print(" "*indent,print_idx,"parent",node.parent)
-  print(" "*indent,print_idx,"lefthash_idx",node.lefthash_idx)
-  print(" "*indent,print_idx,"righthash_idx",node.righthash_idx)
-  print(" "*indent,print_idx,"left",node.left)
-  print(" "*indent,print_idx,"right",node.right)
-  if node.leaf_address_arr:
-    print(" "*indent,print_idx,"leaf_address",node.leaf_address_arr[node.leaf_address_byteidx:node.leaf_address_byteidx+num_address_bytes].hex())
-    print(" "*indent,print_idx,"leaf_address_byteidx",node.leaf_address_byteidx)
-  print(" "*indent,print_idx,"leaf_balance_byteidx",node.leaf_balance_byteidx)
-  if node.leaf_balance_arr:
-    print(" "*indent,print_idx,"leaf_balance",node.leaf_balance_arr[node.leaf_balance_byteidx:node.leaf_balance_byteidx+num_balance_bytes])
-
-def print_subtree(node,depth,indent):
-  global print_idx
-  print_idx += 1
-  print_node(node,indent)
-  if node.left:
-    print_subtree(node.left,depth+node.edge_label_len+1,indent+1)
-  if node.right:
-    print_subtree(node.right,depth+node.edge_label_len+1,indent+1)
-
-
-
-
-def print_node2(node,indent):
-  print("print_node2(",node,",",indent,")")
+  print("print_node(",node,",",indent,")")
   print("\n" + " "*indent + str(indent) + " startbyteidx "             + str(node.startbyteidx) + \
         "\n" + " "*indent + str(indent) + " parent_byteidx "           + str(node.parent_byteidx.cast('I')[0]) + \
         "\n" + " "*indent + str(indent) + " left_or_address_byteidx "  + str(node.left_or_address_byteidx.cast('I')[0]) + \
         "\n" + " "*indent + str(indent) + " right_or_balance_byteidx " + str(node.right_or_balance_byteidx.cast('I')[0]) + \
         "\n" + " "*indent + str(indent) + " node_type "                + str(node.node_type[0]) + \
-        "\n" + " "*indent + str(indent) + " edge_label_len "           + str(node.edge_label_len[0]) + \
-        "\n" + " "*indent + str(indent) + " edge_label_len_total "     + str(node.edge_label_len_total[0]) + \
-        "\n" + " "*indent + str(indent) + " edge_label "               + node.edge_label[:].hex() )
+        "\n" + " "*indent + str(indent) + " edge_label_startbitidx "     + str(node.edge_label_startbitidx.cast('I')[0]) + \
+        "\n" + " "*indent + str(indent) + " edge_label_len "           + str(node.edge_label_len.cast('I')[0]) + \
+        "\n" + " "*indent + str(indent) + " edge_label_byteidx "       + str(node.edge_label_byteidx[0]) + \
+        "\n" + " "*indent + str(indent) + " edge_label "               + bytearray_to_hex(memory, node.edge_label_byteidx.cast('I')[0], num_address_bytes ) )
   if node.node_type[0]==0:
     print(       " "*indent + str(indent) + " address " + memory[node.left_or_address_byteidx.cast('I')[0]:node.left_or_address_byteidx.cast('I')[0]+num_address_bytes].hex())
     print(       " "*indent + str(indent) + " balance " + memory[node.right_or_balance_byteidx.cast('I')[0]:node.right_or_balance_byteidx.cast('I')[0]+num_balance_bytes].hex())
@@ -1188,20 +1129,39 @@ def print_node2(node,indent):
   if node.node_type[0]==2:
     print(       " "*indent + str(indent) + " right hash " + memory[node.right_or_balance_byteidx.cast('I')[0]:node.right_or_balance_byteidx.cast('I')[0]+num_hash_bytes].hex())
 
-
-
-
-def print_subtree2(node_byteidx,depth,indent):
+def print_subtree(node_byteidx,depth,indent):
   global print_idx
-  if debug: print("print_subtree2(",node_byteidx,",",depth,",",indent,")")
+  if debug: print("print_subtree(",node_byteidx,",",depth,",",indent,")")
   print_idx += 1
   node = Tree_node(node_byteidx)
-  depth += node.edge_label_len[0]+1
-  print_node2(node,indent)
+  depth = node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]
+  print_node(node,indent)
   if node.node_type[0] in {2,3}:  # recurse left
-    print_subtree2(node.left_or_address_byteidx.cast('I')[0],depth,indent+1)
+    print_subtree(node.left_or_address_byteidx.cast('I')[0],depth,indent+1)
   if node.node_type[0] in {1,3}:  # recurse right
-    print_subtree2(node.right_or_balance_byteidx.cast('I')[0],depth,indent+1)
+    print_subtree(node.right_or_balance_byteidx.cast('I')[0],depth,indent+1)
+
+
+def print_subtree_addresses(node_byteidx,depth,indent):
+  #print("print_subtree_addresses()")
+  global print_idx
+  print_idx += 1
+  node = Tree_node(node_byteidx)
+  depth = node.edge_label_startbitidx.cast('I')[0]+node.edge_label_len.cast('I')[0]+1
+  if node.node_type[0]==0b00:
+    address = memory[node.left_or_address_byteidx.cast('I')[0]: node.left_or_address_byteidx.cast('I')[0]+num_address_bytes]
+    print(print_idx," "*indent,address.hex())
+  if node.node_type[0] in {2,3}:  # recurse left
+    print_subtree_addresses(node.left_or_address_byteidx.cast('I')[0],depth,indent+1)
+  if node.node_type[0] in {1,3}:  # recurse right
+    print_subtree_addresses(node.right_or_balance_byteidx.cast('I')[0],depth,indent+1)
+
+
+
+
+
+
+
 
 
 
@@ -1229,7 +1189,7 @@ def test_handwritten1():
   """
   # node labels
   node_labels = bin2bytes('11''10''00''10''00''11''00''00''01''00')
-  # edge label lengths
+  # edge label lengths, where 0 == 256
   edge_label_lengths = bytearray([1,num_address_bits-5,num_address_bits-3,1,num_address_bits-5])
   # edge labels
   edge_labels = bytearray([])
@@ -1267,7 +1227,7 @@ def test_handwritten1():
 
   state_root = bytearray([0])
 
-  old_root,new_root = main(calldata,state_root)
+  main(calldata,state_root)
   if debug:
     print()
     print()
@@ -1309,36 +1269,118 @@ def test_insert_leaves():
 
 
 
+def test_find_and_insert(idx):
+  tree = None
+  balance = 100
+  addresses = []
+  if idx == 0:
+    addresses = ['a24eaaf2265062570012569bce29bf73802b1cc4e37c8e52fd9bba9c1334e4e1', 'b4ed0fc3b4075bd62921836b8e32013040fde20544d13eeffad5c4383a7bbccb', 'f5983b4b07bef728caf161c436c36517be3dfc91dee499b2a2e93034a0a43e62']
+    #addresses = ['a24eaaf2265062570012569bce29bf73802b1cc4e37c8e52fd9bba9c1334e4e1', 'b4ed0fc3b4075bd62921836b8e32013040fde20544d13eeffad5c4383a7bbccb', 'f5983b4b07bef728caf161c436c36517be3dfc91dee499b2a2e93034a0a43e62','0000000000000000000000000000000000000000000000000000000000000000']
+    #addresses = ['0000000000000000000000000000000000000000000000000000000000000000','a24eaaf2265062570012569bce29bf73802b1cc4e37c8e52fd9bba9c1334e4e1', 'b4ed0fc3b4075bd62921836b8e32013040fde20544d13eeffad5c4383a7bbccb', 'f5983b4b07bef728caf161c436c36517be3dfc91dee499b2a2e93034a0a43e62']
+  elif idx == 1:
+    addresses = ['006f4fbbe815b1f24d0fb918e01d84ae36c981ea2feb31f2a0dfdde60c1eafb1', 'c59c32187761bdda3d303e2c9a7832f2e43520292c24da43d6fc89e63c62caf0', '2f21cedf4a4be30b8ea21d762226991373adb443c21243d941f9378dfa05faa0']
+  elif idx == 2:
+    addresses = ['130d7941e164c7780694936ef61f1a67b78943052787cb0238e19b09fb0b3d16','aa7466fa5168be169eef6511af50caf95f800e2ca45e03175df9a2078626ba01','c7e5a7d17fe3e2050c067a0418249473ea7c2c3b89c6824e2b569222293cd186']
+  elif idx == 3:
+    addresses = ['77b071a033b60109319dac6b0b9296e6de9610cb29cd90007125bb2fa3564100','80d2f28782ba5b1818f08632b3514ef6e7b163efacac43806e5be3b6c2d99d0e','5bcb5a5bd43e28c9a43a3f0d67fb9b8d45a619f078570665c1e206d318210848']
+
+  tree = None
+
+  for address in addresses:
+    address_byteidx = malloc(num_address_bytes)
+    memory[address_byteidx:address_byteidx+num_address_bytes] = bytes.fromhex(address)
+    print()
+    print()
+    print()
+    print("inserting",memory[address_byteidx:address_byteidx+num_address_bytes].hex())
+    found_node_byteidx,err = find_account_or_neighbor_or_error(tree,address_byteidx)
+    print("back to main",found_node_byteidx,err)
+    if found_node_byteidx:
+      found_node = Tree_node(found_node_byteidx)
+    else:
+      found_node = None
+    tree = insert_leaf(found_node,address_byteidx,balance)
+    
+    while tree.parent_byteidx.cast('I')[0]:
+      tmp_node = Tree_node(tree.parent_byteidx.cast('I')[0])
+      tree = Tree_node(tmp_node.startbyteidx)
+
+    print_idx = 0
+    print_subtree(tree.startbyteidx,0,0)
+
+  print_idx = 0
+  print_subtree_addresses(tree.startbyteidx,0,0)
+
+
+
 def test_generator(num_accounts_in_witness, num_accounts_in_state):
   global num_address_bits
   global num_balance_bits
   global num_hash_bits
   global print_idx
 
-  # generate addresses and insert into tree
+  # generate addresses in witness and build a tree with just them
   tree = None
   import random
   for i in range(num_accounts_in_witness):
+    print("i",i)
     address = bin2bytes(bin(random.randint(0,2**num_address_bits-1))[2:].zfill(num_address_bits))
-    balance = bytearray([100]+[0]*(num_balance_bytes-1)) # random.randint(0, 2**num_balance_bits-1)
+    balance = 100 #random.randint(0, 2**num_balance_bits-1) #bytearray([100]+[0]*(num_balance_bytes-1)) # 
+    # put addy and bal into memory
+    address_byteidx = malloc(num_address_bytes)
+    memory[address_byteidx:address_byteidx+num_address_bytes] = address
     print()
     print("inserting address",address.hex(),"balance",balance)
-    neighbor,err = find_account_or_neighbor(tree,address,0)
+    #neighbor,err = find_account_or_neighbor(tree,address,0)
+    found_node_byteidx,err = find_account_or_neighbor_or_error(tree,address_byteidx)
+    print("found",found_node_byteidx,err)
     if err == "":
       print("tree was empty")
-      tree = insert_leaf(neighbor,address,balance=balance)
+      tree = insert_leaf(None,address_byteidx,balance)
     elif err=="neighbor":
-      print("found neighbor",neighbor,"must insert leaf")
+      print("found neighbor",found_node_byteidx,"must insert leaf")
       # must insert next to neighbor
-      insert_leaf(neighbor,address,balance=balance)
+      #insert_leaf(neighbor,address,balance=balance)
+      insert_leaf(Tree_node(found_node_byteidx),address_byteidx,balance)
     elif err=="account":
-      print("this account is already present")
-    while tree.parent:
-      tree=tree.parent
+      print("this account is already present, this is rare")
+    while tree.parent_byteidx.cast('I')[0]:
+      tmp_node = Tree_node(tree.parent_byteidx.cast('I')[0])
+      tree = Tree_node(tmp_node.startbyteidx)
     print("done inserting address",address,"balance",balance)
+
     # print tree
     print_idx = 0
-    print_subtree(tree,0,0)
+    print_subtree(tree.startbyteidx,0,0)
+    print_idx = 0
+    print_subtree_addresses(tree.startbyteidx,0,0)
+
+  # generate remaining state and insert into tree as dummy hashes
+  address_byteidx = malloc(num_address_bytes)
+  for i in range(num_accounts_in_state):
+    address = bin2bytes(bin(random.randint(0,2**num_address_bits-1))[2:].zfill(num_address_bits))
+    memory[address_byteidx:address_byteidx+num_address_bytes] = address
+    neighbor_byteidx,err = find_account_or_neighbor_or_error(tree,address_byteidx)
+    if err == "neighbor":
+      neighbor = Tree_node(neighbor_byteidx)
+      # found neighbor, so insert it, then change it to a hash
+      insert_leaf(neighbor,address_byteidx,0)
+      # change its neighbor's child to a hash
+      parent = Tree_node(neighbor.parent_byteidx.cast('I')[0])
+      if parent.left_or_address_byteidx.cast('I')==neighbor_byteidx:
+        # make right child a dummy hash
+        hash_byteidx = malloc(num_hash_bytes)
+        parent.right_or_balance_byteidx.cast('I')[0] = hash_byteidx
+        memory[hash_byteidx:hash_byteidx+num_hash_bytes] = bytearray([0]*num_hash_bytes)
+      elif parent.right_or_balance_byteidx.cast('I')==neighbor_byteidx:
+        # make left child a dummy hash
+        hash_byteidx = malloc(num_hash_bytes)
+        parent.left_or_address_byteidx.cast('I')[0] = hash_byteidx
+        memory[hash_byteidx:hash_byteidx+num_hash_bytes] = bytearray([0]*num_hash_bytes)
+      # make sure that tree is still the root, in case it changed after insertion
+      while tree.parent_byteidx.cast('I')[0]:
+        tmp_node = Tree_node(tree.parent_byteidx.cast('I')[0])
+        tree = Tree_node(tmp_node.startbyteidx)
 
 
 
@@ -1346,8 +1388,10 @@ def test_generator(num_accounts_in_witness, num_accounts_in_state):
 if __name__ == "__main__":
   test_handwritten1()
 
-  num_accounts_in_witness = 3
-  num_accounts_in_state = 100
+  num_accounts_in_witness = 1
+  num_accounts_in_state = 1000000
   #test_generator(num_accounts_in_witness, num_accounts_in_state)
+
+  #test_find_and_insert(0)
 
   #test_insert_leaves()
