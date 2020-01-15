@@ -20,10 +20,15 @@
 """
 TODO:
  - signature verification
- - hash navigation, but this can be kept in the get_next_hash(), so can dela
- - insert_leaf() third arg accountdata should be accountdata_byteidx which is already allocated
- - when merkleizing, check that modified_subtree_idxs are correct
+ - hash navigation, but this can be kept in the get_next_hash(), so can delay
+ - problem: modified_subtree_indxs are adversierial:
+   - soln: when merkleizing, check that modified_subtree_idxs are correct
+   - soln: get_next_() functions check bounds
 """
+
+
+import random   # for test generation
+
 
 debug = 1
 
@@ -33,6 +38,8 @@ debug = 1
 # This memory simulates C memory
 memory = bytearray([0]*(2**20))     # more than enough
 
+state_root = bytearray([])
+
 # BYTE SIZES
 # accounts
 num_address_bits=256
@@ -40,7 +47,7 @@ num_accountdata_bits=64
 num_accountdata_bytes = (num_accountdata_bits+7)//8
 num_address_bytes = (num_address_bits+7)//8
 # hashes
-num_hash_bits=160
+num_hash_bits=256
 num_hash_bytes = (num_hash_bits+7)//8
 num_hashes_bytes = 2
 num_hash_byte_idx_bytes = 4
@@ -70,6 +77,8 @@ def init_num_bytes_and_bits():
 
 
 # CALLDATA INFO
+max_tree_depth=0
+
 node_labels_startbyteidx = 0
 node_labels_bytelen = 0
 node_labels_idx = 0
@@ -197,7 +206,8 @@ def memcpy(dst_idx, src_idx, num_bytes):
 
 # 0) decode calldata
 
-# calldata, each with a prefix for number of bytes:
+# calldata, arrays have a prefix with numbytes, see code for prefix sizes
+#  max_tree_depth
 #  node_labels
 #  edge_label_lengths
 #  edge_labels
@@ -207,6 +217,7 @@ def memcpy(dst_idx, src_idx, num_bytes):
 #  transactions
 
 def decode_calldata(memory_idx):
+  global max_tree_depth
   global node_labels_startbyteidx
   global node_labels_bytelen
   global edge_label_lengths_startbyteidx
@@ -230,6 +241,8 @@ def decode_calldata(memory_idx):
     len_ = int.from_bytes(memory[memidx:memidx+num_len_bytes], byteorder="little")
     return memidx+num_len_bytes+len_, memidx+num_len_bytes, len_
   # parse
+  max_tree_depth = memory[memory_idx]
+  memory_idx+=1
   memory_idx, node_labels_startbyteidx, node_labels_bytelen                = get_chunk(memory_idx,2)
   memory_idx, edge_label_lengths_startbyteidx, edge_label_lengths_bytelen  = get_chunk(memory_idx,2)
   memory_idx, edge_labels_startbyteidx, edge_labels_bytelen                = get_chunk(memory_idx,2)
@@ -310,7 +323,7 @@ def get_next_modified_subtree_node_label_idx():
   global modified_subtree_idxs_byteidx
   global next_modified_subtree_node_label_idx
   if modified_subtree_idxs_byteidx-modified_subtree_idxs_startbyteidx >= modified_subtree_idxs_bytelen:
-    next_modified_subtree_node_label_idx = 0
+    next_modified_subtree_node_label_idx = -1
   else:
     next_modified_subtree_node_label_idx = int.from_bytes(memory[modified_subtree_idxs_byteidx:modified_subtree_idxs_byteidx+2], byteorder="little")
     modified_subtree_idxs_byteidx += num_modified_subtree_idxs_bytes
@@ -404,7 +417,7 @@ def build_tree_from_node_labels(edge_label_startbitidx, node):
       print("addresses_byteidx",addresses_byteidx)
       # either leaf or not leaf
       if debug: print("if leaf then true: ",node.edge_label_startbitidx.cast('I')[0] == num_address_bits-1, node.edge_label_startbitidx.cast('I')[0], num_address_bits-1)
-      if node.edge_label_startbitidx.cast('I')[0] + node.edge_label_len.cast('I')[0] == num_address_bits-1:
+      if node.edge_label_startbitidx.cast('I')[0] + node.edge_label_len.cast('I')[0] == num_address_bits:
         if debug: print(debug_build_idx,"build_tree_from_node_labels(",node.edge_label_startbitidx.cast('I')[0],")","found leaf")
         node.left_or_address_byteidx.cast('I')[0] = get_next_address_byteidx()
         node.right_or_accountdata_byteidx.cast('I')[0] = get_next_postaccountdata_byteidx()
@@ -537,7 +550,7 @@ def find_account_or_neighbor_or_error(node,address_byteidx):
     return find_account_or_neighbor_or_error(Tree_node(node.right_or_accountdata_byteidx.cast('I')[0]), address_byteidx)
 
 
-def insert_leaf(neighbor,address_byteidx,accountdata):
+def insert_leaf(neighbor,address_byteidx,accountdata_byteidx):
   print("insert_leaf(",neighbor.startbyteidx if neighbor else neighbor,",",address_byteidx,")")
   # if tree is empty, insert this address and accountdata and return
   # TODO: don't think there should be this possibility, since edge label lengths are unknown, so can't insert first node, but leave it for test generation
@@ -546,7 +559,6 @@ def insert_leaf(neighbor,address_byteidx,accountdata):
     new_leaf = Tree_node(new_leaf_byteidx)
     new_leaf.node_type[0] = 0b00
     #address_byteidx = malloc(num_address_bytes)
-    accountdata_byteidx = malloc(num_accountdata_bytes)
     new_leaf.left_or_address_byteidx.cast('I')[0] = address_byteidx
     new_leaf.right_or_accountdata_byteidx.cast('I')[0] = accountdata_byteidx
     new_leaf.edge_label_startbitidx.cast('I')[0] = 0
@@ -563,7 +575,7 @@ def insert_leaf(neighbor,address_byteidx,accountdata):
   new_leaf = Tree_node(malloc(num_treenode_bytes))
   new_leaf.node_type[0] = 0b00
   new_leaf.left_or_address_byteidx.cast('I')[0] = address_byteidx
-  new_leaf.right_or_accountdata_byteidx.cast('I')[0] = malloc(num_accountdata_bytes)
+  new_leaf.right_or_accountdata_byteidx.cast('I')[0] = accountdata_byteidx
   #print("new_interior_node and new_leaf", new_interior_node.startbyteidx, new_leaf.startbyteidx)
   # first take care of edge labels and lengths
   new_interior_node.edge_label_startbitidx.cast('I')[0] = neighbor.edge_label_startbitidx.cast('I')[0]
@@ -618,6 +630,8 @@ def update_accounts(to_address_byteidx, from_address_byteidx, to_data_byteidx, f
     return None     # error
   if nonce != from_nonce:
     return None     # error
+  if from_data_byteidx == to_data_byteidx:
+    return None     # error, can't send to self
   print("ok")
   from_balance -= value
   to_balance += value
@@ -640,7 +654,6 @@ def process_transactions():
   global memory
   global num_modified_subtrees
   global modified_subtrees
-  num_accountdatas = accountdatas_bytelen//num_accountdata_bytes
   txs_byteidx = transactions_startbyteidx
   txs_end_idx = transactions_startbyteidx+transactions_bytelen
   while txs_byteidx < txs_end_idx:
@@ -661,9 +674,9 @@ def process_transactions():
     from_address_byteidx = addresses_startbyteidx + from_idx*num_address_bytes
     from_data_byteidx = post_accountdatas_startbyteidx + from_idx*num_accountdata_bytes
     # to_data, note we have to_address from signature message
-    if to_idx < num_accountdatas:
+    if to_idx < num_original_accounts:
       to_data_byteidx = post_accountdatas_startbyteidx + to_idx*num_accountdata_bytes
-    elif to_idx < num_accountdatas + num_modified_subtrees:
+    elif to_idx < num_original_accounts + num_modified_subtrees:
       # traverse tree until leaf, possibly inserting a new leaf
       print("must traverse tree.   to_idx>=num_orignal_accounts", to_idx, num_original_accounts)
       node = Tree_node(modified_subtrees_startbyteidx + num_treenode_bytes*(to_idx-num_original_accounts))
@@ -678,16 +691,17 @@ def process_transactions():
       # if not a leaf, must insert leaf
       account = Tree_node(node_account_or_neighbor_byteidx)
       if err=="neighbor":
-        account = insert_leaf(account,to_address_byteidx,0)
+        account = insert_leaf(account,to_address_byteidx,malloc(num_accountdata_bytes))
       to_data_byteidx = account.right_or_accountdata_byteidx.cast('I')[0]
     else:
-      print("error, to_idx is too large")
+      print("error, to_idx is too large  to_idx",to_idx, "  num_original_accounts",num_original_accounts, "  num_modified_subtrees",num_modified_subtrees)
       return -1 # error, maybe should just continue
     # apply account updates
     update_accounts(to_address_byteidx, from_address_byteidx, to_data_byteidx, from_data_byteidx, data_byteidx)
   print("done with process_transactions()")
   print()
   print()
+
 
 
 
@@ -717,16 +731,19 @@ def hash_(dst_byteidx, src_byteidx, len_):
   global hash_state_byteidx
   global num_hash_state_bytes
   global num_hash_bytes
-  if hash_inplace_flag:
-    # TODO: hash here
-    pass
+  global num_address_bytes
+  print("to be hashed",memory[src_byteidx:src_byteidx+len_].hex())
+  #print(num_hash_bytes)
+  if len_==2*num_hash_bytes+1:
+    print("ok1",memory[src_byteidx], memory[src_byteidx+num_hash_bytes])
+    memory[dst_byteidx] = (memory[src_byteidx] + memory[src_byteidx+num_hash_bytes])%256
   else:
-    memcpy(hash_state_byteidx+num_hash_state_bytes, src_byteidx, len_)
-    memory[hash_state_byteidx+num_hash_state_bytes] = (memory[hash_state_byteidx+num_hash_state_bytes] + memory[hash_state_byteidx+num_hash_state_bytes+num_hash_bytes])%256
-    # TODO: hash here
-    memcpy(dst_byteidx, hash_state_byteidx+num_hash_state_bytes, num_hash_bytes)
-  print(memory[dst_byteidx:dst_byteidx+num_hash_bytes].hex())
+    print("ok2",memory[src_byteidx+num_address_bytes])
+    memory[dst_byteidx] = memory[src_byteidx+num_address_bytes]
+  print("result of hashing",memory[dst_byteidx])
 
+
+max_hashstack_byteidx = 0
 
 def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
   print(recursion_depth," "*recursion_depth+"merkleize_modifiable_subtree(",hash_block_byteidx,node.startbyteidx,recursion_depth,")")
@@ -735,34 +752,38 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
   #print(node.startbyteidx,"subtree with address prefix of length ",subtree.address_prefix_len[0], bytearray(subtree.address_prefix.cast('B')[0:num_address_bytes]).hex())
   #print_subtree(subtree.root_byteidx.cast('I')[0],0,0)
   #print()
-  if heap_byteidx < hash_block_byteidx + num_hashblock_bytes:
-    print("GROWING HEAP")
-    print("GROWING HEAP")
-    print("GROWING HEAP")
-    print("GROWING HEAP")
-    print("GROWING HEAP")
-    malloc(hash_block_byteidx + num_hashblock_bytes - heap_byteidx)
-  memory[hash_block_byteidx:hash_block_byteidx+num_hashblock_bytes] = bytearray([0]*num_hashblock_bytes) # zero workspace
+  if max_hashstack_byteidx <= hash_block_byteidx:
+    print()
+    print()
+    print("error: bad max_tree_depth",max_tree_depth,max_hashstack_byteidx, hash_block_byteidx)
+    print()
+    print()
+    return
+  #if heap_byteidx < hash_block_byteidx + num_hashblock_bytes:
+  #  malloc(hash_block_byteidx + num_hashblock_bytes - heap_byteidx)
+  # zero workspace
+  memory[hash_block_byteidx:hash_block_byteidx+num_hashblock_bytes] = bytearray([0]*num_hashblock_bytes)
+  hash_len = num_hashblock_bytes
   print(recursion_depth," "*recursion_depth,node.node_type[0])
   if node.node_type[0]==0b00: # leaf
     memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_address_bytes)
     memcpy(hash_block_byteidx+num_address_bytes, node.right_or_accountdata_byteidx.cast('I')[0], num_accountdata_bytes)
-    memory[hash_block_byteidx+num_address_bytes+num_accountdata_bytes+1] = node.edge_label_len.cast('I')[0]
+    memory[hash_block_byteidx+num_address_bytes+num_accountdata_bytes+1] = node.edge_label_len.cast("I")[0]
     #memcpy(hash_block_byteidx+num_address_bytes+num_accountdata_bytes+1, node.edge_label_len[0], 1)
-    print("to be hashed",memory[hash_block_byteidx:hash_block_byteidx+num_address_bytes+num_accountdata_bytes+1].hex())
+    hash_len = num_address_bytes+num_accountdata_bytes+1
   elif node.node_type[0] == 0b01:
     memcpy(hash_block_byteidx, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_accountdata_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast("I")[0]
   elif node.node_type[0] == 0b10:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
-    memcpy(hash_block_byteidx+num_hash_bytes, node.left_or_address_byteidx.cast('I')[0], num_hash_bytes)
+    memcpy(hash_block_byteidx+num_hash_bytes, node.right_or_accountdata_byteidx.cast('I')[0], num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    print("ok",node.edge_label_startbitidx.cast('I')[0], node.edge_label_len.cast('I')[0])
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
+    #print("ok",node.edge_label_startbitidx.cast('I')[0], node.edge_label_len.cast('I')[0])
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast("I")[0]
   elif node.node_type[0] == 0b11:
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.left_or_address_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
@@ -770,9 +791,9 @@ def merkleize_modifiable_subtree(hash_block_byteidx,node,recursion_depth):
     merkleize_modifiable_subtree(hash_block_byteidx+num_hashblock_bytes, Tree_node(node.right_or_accountdata_byteidx.cast('I')[0]), recursion_depth+1)
     memcpy(hash_block_byteidx+num_hash_bytes, hash_block_byteidx+num_hashblock_bytes, num_hash_bytes)
     #memcpy(hash_block_byteidx+num_hash_bytes+1, node.edge_label_len[0], 1)
-    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast('I')[0]
+    memory[hash_block_byteidx+2*num_hash_bytes+1] = node.edge_label_len.cast("I")[0]
   #print(recursion_depth," "*recursion_depth,"hashing")
-  hash_(hash_block_byteidx, hash_block_byteidx, num_hashblock_bytes)
+  hash_(hash_block_byteidx, hash_block_byteidx, hash_len)
 
 
 modifiable_subtree_idx = 0
@@ -783,9 +804,18 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
   global node_labels_idx
   global account_idx
   num_workspace_bytes = num_hashblock_bytes + post_hash_flag*num_hashblock_bytes
-  if heap_byteidx < hash_block_byteidx + num_workspace_bytes:
-    malloc(hash_block_byteidx + num_workspace_bytes - heap_byteidx)
-  memory[hash_block_byteidx:hash_block_byteidx+num_workspace_bytes] = bytearray([0]*num_workspace_bytes) # zero workspace
+  if max_hashstack_byteidx <= hash_block_byteidx:
+    print()
+    print()
+    print("error: bad max_tree_depth",max_tree_depth,max_hashstack_byteidx, hash_block_byteidx)
+    print()
+    print()
+    return
+  #if heap_byteidx < hash_block_byteidx + num_workspace_bytes:
+  #  malloc(hash_block_byteidx + num_workspace_bytes - heap_byteidx)
+  # zero workspace
+  memory[hash_block_byteidx:hash_block_byteidx+num_workspace_bytes] = bytearray([0]*num_workspace_bytes)
+  hash_len = num_hashblock_bytes
   edge_label_len = 0
   #print(recursion_depth," "*recursion_depth+"node_labels_idx",node_labels_idx,"next_modifiable_subtree_node_label_idx",next_modified_subtree_node_label_idx)
   if node_labels_idx == next_modified_subtree_node_label_idx:
@@ -802,9 +832,9 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
   node_label = get_next_node_label_bitpair()
   #print(recursion_depth," "*recursion_depth+"node_label ",node_label)
   if node_label == 0b00:
-    print(recursion_depth," "*recursion_depth+"node_label == 0b00")
+    print(recursion_depth," "*recursion_depth+"node_label == 0b00 - edge label or leaf")
     #print(recursion_depth," "*recursion_depth+"depth",depth,"num_address_bis",num_address_bits)
-    if depth==num_address_bits-1: # leaf with no edge label, this is rare
+    if depth==num_address_bits: # leaf with no edge label, this is rare
       # put address, prestate accountdata, and edge_label_len=0
       memcpy(hash_block_byteidx, addresses_startbyteidx+account_idx*num_address_bytes,num_address_bytes)
       memcpy(hash_block_byteidx+num_address_bytes, accountdatas_startbyteidx+account_idx*num_accountdata_bytes,num_accountdata_bytes)
@@ -822,13 +852,15 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
       #print(recursion_depth," "*recursion_depth+"post_hash:", post_hash)
       #print()
       #return pre_hash,post_hash
+      hash_len = num_address_bytes+num_accountdata_bytes+1
     else: 
       edge_label_len = get_next_edge_label_length()
-      print(recursion_depth," "*recursion_depth+"edge_label_len",edge_label_len)
       depth += edge_label_len
+      print(recursion_depth," "*recursion_depth+"edge_label_len",edge_label_len, "  depth",depth)
       #print(recursion_depth," "*recursion_depth+"    edge_label_len",edge_label_len)
       #print(recursion_depth," "*recursion_depth+depth,num_address_bits-1)
-      if depth==num_address_bits-1: # a leaf with an edge label
+      if depth==num_address_bits: # a leaf with an edge label
+        print(recursion_depth," "*recursion_depth+"its a leaf with an edge label")
         memcpy(hash_block_byteidx, addresses_startbyteidx+account_idx*num_address_bytes,num_address_bytes)
         memcpy(hash_block_byteidx+num_address_bytes, accountdatas_startbyteidx+account_idx*num_accountdata_bytes,num_accountdata_bytes)
         memory[hash_block_byteidx+num_address_bytes+num_accountdata_bytes+1] = edge_label_len
@@ -842,6 +874,7 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
         #print(recursion_depth," "*recursion_depth+"post_hash:", post_hash)
         #print()
         #return pre_hash,post_hash
+        hash_len = num_address_bytes+num_accountdata_bytes+1
       else: # not a leaf, get next node label and process it below
         node_label = get_next_node_label_bitpair()
     #print(recursion_depth," "*recursion_depth+"node_label after 00",node_label)
@@ -863,6 +896,7 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
     #print(recursion_depth," "*recursion_depth+"post_hash:", post_hash)
     #print()
   elif node_label == 0b10:
+    print(recursion_depth," "*recursion_depth+"node_label == 0b10")
     # compute and get left hash
     left_hash_byteidx = hash_block_byteidx+num_workspace_bytes
     merkleize_pre_and_post(left_hash_byteidx,depth+1,recursion_depth+1,post_hash_flag)
@@ -875,6 +909,7 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
     if post_hash_flag==1:
       memcpy(hash_block_byteidx+num_hashblock_bytes+num_hash_bytes, right_hash_byteidx, num_hash_bytes)
   elif node_label == 0b11:
+    print(recursion_depth," "*recursion_depth+"node_label == 0b11")
     # compute and get left hash
     left_hash_byteidx = hash_block_byteidx+num_workspace_bytes
     merkleize_pre_and_post(left_hash_byteidx,depth+1,recursion_depth+1,post_hash_flag)
@@ -887,14 +922,15 @@ def merkleize_pre_and_post(hash_block_byteidx,depth,recursion_depth,post_hash_fl
     memcpy(hash_block_byteidx+num_hash_bytes, right_hash_byteidx, num_hash_bytes)
     if post_hash_flag==1:
       memcpy(hash_block_byteidx+num_hashblock_bytes+num_hash_bytes, right_hash_byteidx+num_hashblock_bytes, num_hash_bytes)
-  hash_(hash_block_byteidx, hash_block_byteidx, num_hashblock_bytes)
+  hash_(hash_block_byteidx, hash_block_byteidx, hash_len)
   if post_hash_flag==1:
-    hash_(hash_block_byteidx+num_hashblock_bytes, hash_block_byteidx+num_hashblock_bytes, num_hashblock_bytes)
-  
+    hash_(hash_block_byteidx+num_hashblock_bytes, hash_block_byteidx+num_hashblock_bytes, hash_len)
 
 
 
-def init_merkleization_and_merkleize(hash_block_byteidx):
+
+
+def init_merkleization_and_merkleize():
   global node_labels_idx
   global edge_labels_startbyteidx
   global edge_label_lengths_idx
@@ -904,6 +940,7 @@ def init_merkleization_and_merkleize(hash_block_byteidx):
   global addresses_startbyteidx
   global accountdatas_startbyteidx
   global transactions_startbyteidx
+  global max_hashstack_byteidx
   # init stuff
   node_labels_idx = 0
   edge_label_lengths_idx = 0
@@ -920,8 +957,12 @@ def init_merkleization_and_merkleize(hash_block_byteidx):
   modifiable_subtree_idx = 0
   global account_idx
   account_idx = 0
+  # init stack
+  stack_byteidx = malloc((max_tree_depth+1)*num_hashblock_bytes)
+  max_hashstack_byteidx = stack_byteidx+(max_tree_depth+1)*2*num_hashblock_bytes
   # finally, compute new and old hashes
-  merkleize_pre_and_post(hash_block_byteidx,0,0,1)
+  merkleize_pre_and_post(stack_byteidx,0,0,1)
+  return stack_byteidx
 
 
 
@@ -934,15 +975,18 @@ def init_merkleization_and_merkleize(hash_block_byteidx):
 
 
 
-
-
-
-def main(calldata,arg_state_root):
+def main(calldata):
   global post_accountdatas_startbyteidx
   global num_original_accounts
   global modified_subtrees
   global memory
   global state_root
+  global max_tree_depth
+
+  init_num_bytes_and_bits()
+
+  print("calldata")
+  print(calldata)
 
   # 0) decode calldata
   malloc(len(calldata))
@@ -952,6 +996,7 @@ def main(calldata,arg_state_root):
   calldata_startbyteidx = 0
   decode_calldata(calldata_startbyteidx)
   if 1:
+    print("max_tree_depth",max_tree_depth)
     print("node_labels idxs",node_labels_startbyteidx, node_labels_bytelen)
     print("edge_label_lengths idx",edge_label_lengths_startbyteidx, edge_label_lengths_bytelen)
     print("edge_labels idxs",edge_labels_startbyteidx, edge_labels_bytelen)
@@ -962,7 +1007,6 @@ def main(calldata,arg_state_root):
     print("transactions idxs",transactions_startbyteidx, transactions_bytelen)
 
 
-
   # 1) copy pre-accountdatas to post-accountdatas
   if debug:
     print()
@@ -970,7 +1014,7 @@ def main(calldata,arg_state_root):
   post_accountdatas_startbyteidx = malloc(accountdatas_bytelen)
   memcpy(post_accountdatas_startbyteidx, accountdatas_startbyteidx, accountdatas_bytelen)
   num_original_accounts = accountdatas_bytelen//num_accountdata_bytes
-
+  print("num_original_accounts, accountdatas_bytelen, num_accountdata_bytes",num_original_accounts, accountdatas_bytelen, num_accountdata_bytes)
 
 
   # 2) build each modified subtree
@@ -1035,18 +1079,18 @@ def main(calldata,arg_state_root):
   if debug:
     print()
     print("4) Merkleize pre and post root")
-  hash_block_byteidx = malloc(2*num_hashblock_bytes)
-  init_merkleization_and_merkleize(hash_block_byteidx)
+  hash_block_byteidx = init_merkleization_and_merkleize()
+  
 
   print("preroot:",memory[hash_block_byteidx:hash_block_byteidx+num_hash_bytes].hex())
-  print("postroot:",memory[hash_block_byteidx+num_hash_bytes:hash_block_byteidx+2*num_hash_bytes].hex())
+  print("postroot:",memory[hash_block_byteidx+num_hashblock_bytes:hash_block_byteidx+num_hashblock_bytes+num_hash_bytes].hex())
 
   """
   # 5) check if computed_old_root equas old_root
   if debug:
     print()
     print("5) check if computed_old_root equas old_root")
-  if computed_old_root == arg_state_root:
+  if computed_old_root == state_root:
     state_root = new_root
 
   return computed_old_root, new_root
@@ -1071,26 +1115,11 @@ def main(calldata,arg_state_root):
 
 
 
-########################
-# helpers to write tests
-
-def int2bytes(int_,len_):
-  return int_.to_bytes(len_, byteorder='little')
-
-def bin2bytes(binstr):
-  binstr = binstr.ljust(8*((len(binstr)+7) // 8), '0')
-  bytes_ = int(binstr, 2).to_bytes((len(binstr)+7) // 8, byteorder='big')
-  return bytes_
-
-def bytes2bin(bytes_):
-  binstr = ''
-  for b in bytes_:
-    binstr += bin(b)[2:].zfill(8)
-  return binstr
 
 
 
 
+#######################
 # helper to print stuff
 
 print_idx = 0
@@ -1148,88 +1177,10 @@ def print_subtree_addresses(node_byteidx,depth,indent):
 
 
 
+################################
+# Tests of general functionality 
 
-
-
-
-
-
-def test_handwritten1():
-  global num_address_bits
-  global num_accountdata_bits
-  global num_hash_bits
-  def encode_chunk(chunk, num_len_bytes):
-    chunk_encoded = len(chunk).to_bytes(num_len_bytes, byteorder='little') + chunk
-    #print("encoding chunk:",chunk, "to", chunk_encoded)
-    return chunk_encoded
-  """
-  11
-   l 10
-    l 00 10
-     l 00
-     r h
-    r h
-   r 11
-    l 00
-    r 00 01
-     l h
-     r 00
-  """
-  # node labels
-  node_labels = bin2bytes('11''10''00''10''00''11''00''00''01''00')
-  # edge label lengths, where 0 == 256
-  edge_label_lengths = bytearray([1,num_address_bits-5,num_address_bits-3,1,num_address_bits-5])
-  # edge labels
-  edge_labels = bytearray([])
-  # modified_subtree_idxs: node label idx, edge label lengths idx, edge labels idx, hashes idx, accounts idx, depth
-  modified_subtree_idxs = int2bytes(1,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(1,1)
-  # hashes
-  hashes = bin2bytes( \
-          '00000001'.ljust(num_hash_bits,'0') + \
-          '00000010'.ljust(num_hash_bits,'0') + \
-          '00000011'.ljust(num_hash_bits,'0') )
-  # addresses
-  addresses = bin2bytes( \
-         '0010'.ljust(num_address_bits,'0') + \
-         '1010'.ljust(num_address_bits,'0') + \
-         '1111'.ljust(num_address_bits,'0'))
-  # accountdatas 
-  accountdatas = \
-          (2).to_bytes(num_accountdata_bytes,'little') + \
-          (5).to_bytes(num_accountdata_bytes,'little') + \
-          (7).to_bytes(num_accountdata_bytes,'little')
-  # transactions: sender idx, receiver idx, signature, message (receiver address, value)
-  #   0010.. sends 1 to 1111..    1010.. sends 3 to 0000.. 
-  transactions = \
-      bytearray([0,2]) + bin2bytes('0'.ljust(num_signature_bits,'0') + '1111'.ljust(num_address_bits,'0')) + int2bytes(1,num_accountdata_bytes) + \
-      bytearray([1,3]) + bin2bytes('0'.ljust(num_signature_bits,'0') + '0000'.ljust(num_address_bits,'0')) + int2bytes(3,num_accountdata_bytes)
-  calldata = encode_chunk(node_labels,2) + \
-             encode_chunk(edge_label_lengths,2) + \
-             encode_chunk(edge_labels,2) + \
-             encode_chunk(modified_subtree_idxs,2) + \
-             encode_chunk(hashes,4) + \
-             encode_chunk(addresses,2) + \
-             encode_chunk(accountdatas,2) + \
-             encode_chunk(transactions,2)
-  calldata = bytearray(calldata)
-
-  # print calldata
-  hex_str_commas = ''
-  for b in calldata:
-    hex_str_commas +=','+hex(b)
-  print("calldata as hex separated by commas:")
-  print(hex_str_commas)
-
-  state_root = bytearray([0])
-
-  main(calldata,state_root)
-  if debug:
-    print()
-    print()
-    #print("final pre_hash:", pre_hash)
-    #print("final post_hash:", post_hash)
-
-
+# THIS IS OLD
 def test_insert_leaves():
   global print_idx
   accountdata = bytearray([0]*num_accountdata_bytes)
@@ -1248,11 +1199,11 @@ def test_insert_leaves():
     neighbor,err = find_account_or_neighbor(tree,address,0)
     if err == "":
       print("tree was empty")
-      tree = insert_leaf(neighbor,address,accountdata=accountdata)
+      tree = insert_leaf(neighbor,address,accountdata)
     elif err=="neighbor":
       print("found neighbor",neighbor,"must insert leaf")
       # must insert next to neighbor
-      insert_leaf(neighbor,address,accountdata=accountdata)
+      insert_leaf(neighbor,address,accountdata)
     elif err=="account":
       print("this account is already present")
     while tree.parent:
@@ -1266,7 +1217,8 @@ def test_insert_leaves():
 
 def test_find_and_insert(idx):
   tree = None
-  accountdata = 100
+  accountdata_byteidx = malloc(num_accountdata_bytes)
+  memory[accountdata_byteidx] = 100
   addresses = []
   if idx == 0:
     addresses = ['a24eaaf2265062570012569bce29bf73802b1cc4e37c8e52fd9bba9c1334e4e1', 'b4ed0fc3b4075bd62921836b8e32013040fde20544d13eeffad5c4383a7bbccb', 'f5983b4b07bef728caf161c436c36517be3dfc91dee499b2a2e93034a0a43e62']
@@ -1294,7 +1246,7 @@ def test_find_and_insert(idx):
       found_node = Tree_node(found_node_byteidx)
     else:
       found_node = None
-    tree = insert_leaf(found_node,address_byteidx,accountdata)
+    tree = insert_leaf(found_node,address_byteidx,accountdata_byteidx)
     
     while tree.parent_byteidx.cast('I')[0]:
       tmp_node = Tree_node(tree.parent_byteidx.cast('I')[0])
@@ -1308,6 +1260,203 @@ def test_find_and_insert(idx):
 
 
 
+
+
+#########################
+# Test witness generators
+
+
+# helpers to write tests
+
+def int2bytes(int_,len_):
+  return int_.to_bytes(len_, byteorder='little')
+
+def bin2bytes(binstr):
+  binstr = binstr.ljust(8*((len(binstr)+7) // 8), '0')
+  bytes_ = int(binstr, 2).to_bytes((len(binstr)+7) // 8, byteorder='big')
+  return bytes_
+
+def bytes2bin(bytes_):
+  binstr = ''
+  for b in bytes_:
+    binstr += bin(b)[2:].zfill(8)
+  return binstr
+
+def encode_chunk(chunk, num_len_bytes):
+  chunk_encoded = len(chunk).to_bytes(num_len_bytes, byteorder='little') + chunk
+  #print("encoding chunk:",chunk, "to", chunk_encoded)
+  return chunk_encoded
+
+
+
+
+
+
+def test_handwritten1():
+  global num_address_bits
+  global num_accountdata_bits
+  global num_hash_bits
+  """
+  11
+   l 10
+    l 00 10
+     l 00
+     r h
+    r h
+   r 11
+    l 00
+    r 00 01
+     l h
+     r 00
+
+
+    0/   \1
+   0/   0/ \1
+   1|   1| |1
+   0/   0|  \1
+  """
+  # node labels
+  node_labels = bin2bytes('11''10''00''10''00''11''00''00''01''00')
+  # edge label lengths, where 0 == 256
+  edge_label_lengths = bytearray([1,num_address_bits-4,num_address_bits-2,1,num_address_bits-4])
+  # edge labels
+  edge_labels = bytearray([])
+  # modified_subtree_idxs: node label idx, edge label lengths idx, edge labels idx, hashes idx, accounts idx, depth
+  modified_subtree_idxs = int2bytes(1,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(0,2) + int2bytes(1,1)
+  # hashes
+  hashes = bin2bytes( \
+          '00000001'.ljust(num_hash_bits,'0') + \
+          '00000010'.ljust(num_hash_bits,'0') + \
+          '00000011'.ljust(num_hash_bits,'0') )
+  # addresses
+  addresses = bin2bytes( \
+         '0010'.ljust(num_address_bits,'0') + \
+         '1010'.ljust(num_address_bits,'0') + \
+         '1111'.ljust(num_address_bits,'0'))
+  # accountdatas 
+  accountdatas = \
+          (2).to_bytes(num_accountdata_bytes,'little') + \
+          (5).to_bytes(num_accountdata_bytes,'little') + \
+          (7).to_bytes(num_accountdata_bytes,'little')
+  # transactions: sender idx, receiver idx, signature, message (receiver address, value)
+  #   0010.. sends 1 to 1111..    1010.. sends 3 to 0000.. 
+  transactions = \
+      bytearray([0,2]) + bin2bytes('0'.ljust(num_signature_bits,'0') + '1111'.ljust(num_address_bits,'0')) + int2bytes(1,num_accountdata_bytes) + \
+      bytearray([1,3]) + bin2bytes('0'.ljust(num_signature_bits,'0') + '0000'.ljust(num_address_bits,'0')) + int2bytes(3,num_accountdata_bytes)
+  calldata = bytearray([6]) + \
+             encode_chunk(node_labels,2) + \
+             encode_chunk(edge_label_lengths,2) + \
+             encode_chunk(edge_labels,2) + \
+             encode_chunk(modified_subtree_idxs,2) + \
+             encode_chunk(hashes,4) + \
+             encode_chunk(addresses,2) + \
+             encode_chunk(accountdatas,2) + \
+             encode_chunk(transactions,2)
+  calldata = bytearray(calldata)
+
+  # print calldata
+  hex_str_commas = ''
+  for b in calldata:
+    hex_str_commas +=','+hex(b)
+  print("calldata as hex separated by commas:")
+  print(hex_str_commas)
+
+  state_root = bytearray([0])
+
+  main(calldata)
+  if debug:
+    print()
+    print()
+    #print("final pre_hash:", pre_hash)
+    #print("final post_hash:", post_hash)
+
+
+
+
+
+
+
+
+
+
+# traverse tree, accumulating calldata bytearrays
+node_labels_bits=None
+node_labels_bytes=None
+edge_label_lens_bytes=None
+addresses_bytes=None
+accountdata_bytes=None
+hashes_bytes=None
+def tree2calldata_recursive_helper(node,depth,recursion_depth):
+  #print("tree2calldata_recursive_helper(",node,depth,")")
+  global node_labels_bits
+  global edge_labels_bytes
+  global edge_label_lens_bytes
+  global addresses_bytes
+  global accountdata_bytes
+  global hashes_bytes
+  global max_tree_depth
+  global num_accountdata_bytes
+  if recursion_depth>max_tree_depth:
+    max_tree_depth=recursion_depth
+  # if leaf
+  if node.node_type[0] == 0b00:
+    node_labels_bits += "00"
+    if node.edge_label_len.cast('I')[0] != 0:
+      edge_label_lens_bytes += bytearray([node.edge_label_len.cast("I")[0]%256])
+    addresses_bytes += memory[node.left_or_address_byteidx.cast("I")[0]:node.left_or_address_byteidx.cast("I")[0]+num_address_bytes]
+    accountdata_bytes += memory[node.right_or_accountdata_byteidx.cast("I")[0]:node.right_or_accountdata_byteidx.cast("I")[0]+num_accountdata_bytes]
+    return
+  # if have edge label, not leaf
+  if node.edge_label_len.cast('I')[0] != 0:
+    node_labels_bits += "00"
+    edge_label_lens_bytes += bytearray([node.edge_label_len.cast("I")[0]%256])
+    depth+=node.edge_label_len.cast('I')[0]
+  # node type. note: not a leaf and edge label, if any, already handled above
+  if node.node_type[0] == 0b01:
+    node_labels_bits += "01"
+    tree2calldata_recursive_helper(Tree_node(node.right_or_accountdata_byteidx.cast('I')[0]), depth+1, recursion_depth+1)
+    hashes_bytes += memory[node.left_or_address_byteidx.cast("I")[0]:node.left_or_address_byteidx.cast("I")[0]+num_hash_bytes]
+  elif node.node_type[0] == 0b10:
+    node_labels_bits += "10"
+    tree2calldata_recursive_helper(Tree_node(node.left_or_address_byteidx.cast('I')[0]),depth+1, recursion_depth+1)
+    hashes_bytes += memory[node.right_or_accountdata_byteidx.cast("I")[0]:node.right_or_accountdata_byteidx.cast("I")[0]+num_hash_bytes]
+  elif node.node_type[0] == 0b11:
+    node_labels_bits += "11"
+    tree2calldata_recursive_helper(Tree_node(node.left_or_address_byteidx.cast('I')[0]),depth+1, recursion_depth+1)
+    tree2calldata_recursive_helper(Tree_node(node.right_or_accountdata_byteidx.cast('I')[0]),depth+1, recursion_depth+1)
+
+
+def tree2calldata(root):
+  global node_labels_bits
+  global node_labels_bytes
+  global edge_label_lens_bytes
+  global addresses_bytes
+  global accountdata_bytes
+  global hashes_bytes
+  global max_tree_depth
+  # init
+  node_labels_bits=""
+  edge_label_lens_bytes=bytearray([])
+  edge_label_lengths_bytes=bytearray([])
+  addresses_bytes=bytearray([])
+  accountdata_bytes=bytearray([])
+  hashes_bytes=bytearray([])
+  max_tree_depth=0
+  # start traversal
+  tree2calldata_recursive_helper(root,0,0)
+  # fix byte arrays
+  node_labels_bytes = bytearray([])
+  for bitstr8 in [node_labels_bits[i:i+8] for i in range(0, len(node_labels_bits), 8)]:
+    if len(bitstr8)<8:
+      bitstr8 += "0"*(8-len(bitstr8))
+    node_labels_bytes += int(bitstr8, 2).to_bytes(1, byteorder='big')
+  # return results
+  return (node_labels_bytes, edge_label_lens_bytes, addresses_bytes, accountdata_bytes, hashes_bytes, max_tree_depth)
+
+
+
+
+
 def test_generator(num_accounts_in_witness, num_accounts_in_state):
   global num_address_bits
   global num_accountdata_bits
@@ -1316,33 +1465,33 @@ def test_generator(num_accounts_in_witness, num_accounts_in_state):
 
   # generate addresses in witness and build a tree with just them
   tree = None
-  import random
   for i in range(num_accounts_in_witness):
     print("i",i)
     address = bin2bytes(bin(random.randint(0,2**num_address_bits-1))[2:].zfill(num_address_bits))
-    accountdata = 100 #random.randint(0, 2**num_accountdata_bits-1) #bytearray([100]+[0]*(num_accountdata_bytes-1)) # 
+    accountdata_byteidx = malloc(num_accountdata_bytes) #random.randint(0, 2**num_accountdata_bits-1) #bytearray([100]+[0]*(num_accountdata_bytes-1)) # 
+    memory[accountdata_byteidx]=100
     # put addy and bal into memory
     address_byteidx = malloc(num_address_bytes)
     memory[address_byteidx:address_byteidx+num_address_bytes] = address
     print()
-    print("inserting address",address.hex(),"accountdata",accountdata)
+    print("inserting address",address.hex(),"accountdata",memory[accountdata_byteidx:accountdata_byteidx+num_accountdata_bytes].hex())
     #neighbor,err = find_account_or_neighbor(tree,address,0)
     found_node_byteidx,err = find_account_or_neighbor_or_error(tree,address_byteidx)
     print("found",found_node_byteidx,err)
     if err == "":
       print("tree was empty")
-      tree = insert_leaf(None,address_byteidx,accountdata)
+      tree = insert_leaf(None,address_byteidx,accountdata_byteidx)
     elif err=="neighbor":
       print("found neighbor",found_node_byteidx,"must insert leaf")
       # must insert next to neighbor
       #insert_leaf(neighbor,address,accountdata=accountdata)
-      insert_leaf(Tree_node(found_node_byteidx),address_byteidx,accountdata)
+      insert_leaf(Tree_node(found_node_byteidx),address_byteidx,accountdata_byteidx)
     elif err=="account":
       print("this account is already present, this is rare")
     while tree.parent_byteidx.cast('I')[0]:
       tmp_node = Tree_node(tree.parent_byteidx.cast('I')[0])
       tree = Tree_node(tmp_node.startbyteidx)
-    print("done inserting address",address,"accountdata",accountdata)
+    print("done inserting address",address.hex(),"accountdata",memory[accountdata_byteidx:accountdata_byteidx+num_accountdata_bytes].hex())
 
     # print tree
     print_idx = 0
@@ -1389,15 +1538,72 @@ def test_generator(num_accounts_in_witness, num_accounts_in_state):
   print_idx = 0
   print_subtree_addresses(tree.startbyteidx,0,0)
 
+  return tree
+
+
+def generate_calldata(num_accounts_in_witness, num_accounts_in_state, num_transactions_to_existing, num_transactions_to_new):
+
+  tree = test_generator(num_accounts_in_witness, num_accounts_in_state)
+
+  # traverse tree collecting bytes of witness
+  node_labels_bytes, edge_label_lens_bytes, addresses_bytes, accountdatas_bytes, hashes_bytes, max_tree_depth = tree2calldata(tree)
+
+  # generate transactions
+  transactions_bytes = bytearray([])
+  for i in range(num_transactions_to_existing):
+    from_addy_idx = random.randint(0,num_accounts_in_witness-1)
+    to_addy_idx = random.randint(0,num_accounts_in_witness-1)
+    from_nonce = 0 #TODO: bug here, must increment nonce for that address
+    amount = 1
+    # transactions: sender idx, receiver idx, signature, message (receiver address, value)
+    transactions_bytes += bytearray([from_addy_idx,to_addy_idx]) + bin2bytes('0'.ljust(num_signature_bits,'0')) + addresses_bytes[to_addy_idx*num_address_bytes: to_addy_idx*num_address_bytes+num_address_bytes] + int2bytes(amount,num_balance_bytes) + int2bytes(from_nonce,num_nonce_bytes)
+
+  modified_subtree_idxs_bytes = bytearray([])
+  for i in range(num_transactions_to_new):
+    pass
+    #TODO
+  
+
+  # modified subtrees
+  edge_labels_bytes = bytearray([])
+
+  # finally, concatenate everything
+  calldata = bytearray([max_tree_depth]) + \
+             encode_chunk(node_labels_bytes,2) + \
+             encode_chunk(edge_label_lens_bytes,2) + \
+             encode_chunk(edge_labels_bytes,2) + \
+             encode_chunk(modified_subtree_idxs_bytes,2) + \
+             encode_chunk(hashes_bytes,4) + \
+             encode_chunk(addresses_bytes,2) + \
+             encode_chunk(accountdatas_bytes,2) + \
+             encode_chunk(transactions_bytes,2)
+             
+  print("edge_label_lens_bytes",edge_label_lens_bytes)
+  calldata = bytearray(calldata)
+  return calldata
+
+
+
 
 
 if __name__ == "__main__":
-  test_handwritten1()
+  #test_handwritten1()
 
   num_accounts_in_witness = 10
-  num_accounts_in_state = 10000000
+  num_accounts_in_state = 100
+  num_transactions_to_existing = 4
+  num_transactions_to_new = 0
   #test_generator(num_accounts_in_witness, num_accounts_in_state)
+
+  num_accounts_in_witness = 10
+  num_accounts_in_state = 200
+  num_transactions_to_existing = 10
+  num_transactions_to_new = 0
+  calldata = generate_calldata(num_accounts_in_witness, num_accounts_in_state, num_transactions_to_existing, num_transactions_to_new)
+  main(calldata)
 
   #test_find_and_insert(0)
 
   #test_insert_leaves()
+
+

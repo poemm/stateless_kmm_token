@@ -27,10 +27,14 @@ make
 # to test with scout:
 path/to/scout/target/release/phase2-scout test.yaml
 
+
+TODO
+ - get_next_ check bounds
+
 */
 
-#define WASM 0
-#define DEBUG 1
+//#define WASM 0
+#define DEBUG 0
 
 #if WASM
 #include "ewasm.h"
@@ -51,6 +55,8 @@ int debug = 0;
 ///////////////
 // some globals
 
+uint8_t* state_root = NULL;
+
 // BYTE SIZES
 // for speedup can fix them with #define or const, but leave them as variables for now
 // accounts
@@ -59,12 +65,11 @@ uint32_t num_accountdata_bits=64;
 uint32_t num_accountdata_bytes = 0; //{(num_accountdata_bits+7)/8};
 uint32_t num_address_bytes = 0; //(num_address_bits+7)/8;
 // hashes
-uint32_t num_hash_bits=160;
+uint32_t num_hash_bits=256;
 uint32_t num_hash_bytes = 0; //(num_hash_bits+7)/8;
 uint32_t num_hashes_bytes = 2;
 uint32_t num_hash_byte_idx_bytes = 4;
 uint32_t num_hash_navigation_bytes = 0; //num_address_bytes+num_hashes_bytes+num_hash_byte_idx_bytes;
-uint32_t num_hashblock_bytes = 0;
 // signature
 uint32_t num_signature_bytes = 64;
 uint32_t num_signature_bits = 0; //num_signature_bytes*8;
@@ -78,12 +83,11 @@ uint32_t num_modified_subtree_idxs_bytes = 11;
 
 
 // if change these consts later, must update
-void init_num_bytes_and_bits(){
+void init_num_bytes_and_bits() {
   num_accountdata_bytes = (num_accountdata_bits+7)/8;
   num_address_bytes = (num_address_bits+7)/8;
   num_hash_bytes = (num_hash_bits+7)/8;
   num_hash_navigation_bytes = num_address_bytes+num_hashes_bytes+num_hash_byte_idx_bytes;
-  num_hashblock_bytes = 2*num_hash_bytes+1;
   num_signature_bits = num_signature_bytes*8;
   num_message_bits = num_message_bytes*8;
   num_transaction_bytes=1+1+num_signature_bytes+num_address_bytes+num_accountdata_bytes;
@@ -93,6 +97,8 @@ void init_num_bytes_and_bits(){
 
 
 // CALLDATA INFO
+uint32_t max_tree_depth = 0;
+
 uint8_t* node_labels_start = 0;
 uint32_t node_label_currentidx = 0;
 uint32_t node_labels_bytelen = 0;
@@ -172,6 +178,10 @@ uint32_t bitcompare(uint8_t* byteptr1, uint8_t* byteptr2, uint32_t startbitidx, 
 void decode_calldata(uint8_t* calldata){
 
   uint8_t *calldata_iter = calldata;
+
+  // max tree depth
+  max_tree_depth = (uint32_t) *calldata_iter;
+  calldata+=1;
 
   // node labels
   node_labels_bytelen = (uint32_t)(*(uint16_t*)calldata);
@@ -275,11 +285,11 @@ uint8_t* get_next_address(){
 }
 
 uint32_t next_modified_subtree_node_label_idx = 0;
-uint8_t* get_next_modified_subtree_node_label_idx(){
+void get_next_modified_subtree_node_label_idx(){
   // this is used to merkleize pre&post
   //printf("get_next_modified_subtree_node_label_idx()");
   if (modified_subtree_idx_current-modified_subtree_idxs_start >= modified_subtree_idxs_bytelen)
-    next_modified_subtree_node_label_idx = 0;
+    next_modified_subtree_node_label_idx = -1;
   else{
     next_modified_subtree_node_label_idx = *(uint16_t*)modified_subtree_idx_current;
     modified_subtree_idx_current += num_modified_subtree_idxs_bytes;
@@ -353,7 +363,7 @@ void build_tree_from_node_labels(struct Tree_node* node, uint32_t edge_label_sta
       // there is an edge label, get it
       node->edge_label_len = get_next_edge_label_length();
       // either leaf or not leaf
-      if (node->edge_label_startbitidx + node->edge_label_len == num_address_bits-1){
+      if (node->edge_label_startbitidx + node->edge_label_len == num_address_bits){
         node->left = get_next_address();
         node->right = get_next_postaccountdata();
         node->node_type = 0;
@@ -398,19 +408,21 @@ void build_tree_from_node_labels(struct Tree_node* node, uint32_t edge_label_sta
 
 
 // build each subtree, put them in a global array
-struct Tree_node* modified_subtrees;
+struct Tree_node* modified_subtrees = NULL;
 void build_modified_subtrees(){
   #if DEBUG
     printf("build_modified_subtrees()\n");
   #endif
   modified_subtrees = (struct Tree_node*) malloc(num_modified_subtrees*sizeof(struct Tree_node));
-  printf("modified_subtree_idx_current %p\n",modified_subtree_idx_current);
+  //printf("modified_subtree_idx_current %p\n",modified_subtree_idx_current);
   //printf("%p\n",modified_subtree_idx_current);
   //uint8_t* modified_subtree_idx_current = modified_subtree_idxs_start;
   //printf("%p\n",modified_subtree_idx_current);
   for (int i=0; i<num_modified_subtrees; i++){
     // get all relevant idxs
-    for (int j=0; j<11; j++){ printf("%02x ",modified_subtree_idx_current[j]); }
+    #if DEBUG
+      for (int j=0; j<11; j++){ printf("%02x ",modified_subtree_idx_current[j]); }
+    #endif
     uint32_t node_labels_idx            = (uint32_t) *((uint16_t*)modified_subtree_idx_current);
     uint32_t edge_label_lengths_idx     = (uint32_t) *((uint16_t*)(modified_subtree_idx_current+2));
     uint32_t edge_labels_idx            = (uint32_t) *((uint16_t*)(modified_subtree_idx_current+4));
@@ -445,7 +457,7 @@ void build_modified_subtrees(){
 
 //  3) process transactions 
 
-struct Tree_node* find_account_or_neighbor_or_error(struct Tree_node* node, uint8_t* address_current){
+struct Tree_node* find_account_or_neighbor_or_error(struct Tree_node* node, uint8_t* address_current, uint32_t depth){
   #if DEBUG
     printf("find_account_or_neighbor_or_error( %p, %p)\n", node, address_current);
   #endif
@@ -458,17 +470,16 @@ struct Tree_node* find_account_or_neighbor_or_error(struct Tree_node* node, uint
     //printf("%p %p\n",address_current, node->edge_label);
     //printf("%u %u\n",node->edge_label_startbitidx, node->edge_label_len);
     //printf("%p %p %u %u\n",address_current, node->edge_label, node->edge_label_startbitidx, node->edge_label_len);
-    printf("ok1\n");
     if (bitcompare(address_current, node->edge_label, node->edge_label_startbitidx, node->edge_label_len) != node->edge_label_startbitidx+node->edge_label_len){
-      printf("ok2\n");
       return node; // leaf not present, but have neighbor
     }
-    printf("ok3\n");
     //if (debug) printf("ok2\n");
   }
   // if leaf
   if (node->node_type == 0){ // leaf; or, equivalently, label_endbitidx==num_address_bits-1
-    if (debug) printf("found leaf\n");
+    #if DEBUG
+      printf("found leaf\n");
+    #endif
     return node;
   }
   // recurse left/right based on next bit
@@ -478,24 +489,28 @@ struct Tree_node* find_account_or_neighbor_or_error(struct Tree_node* node, uint
       #if DEBUG
         printf("error, can't recurse left into hash\n");
       #endif
+      //if (depth>10)
+      //  printf("depth %u\n",depth);
       return NULL;
     }
     #if DEBUG
       printf("recurse left %i\n",nextbit);
     #endif
-    return find_account_or_neighbor_or_error((struct Tree_node*)node->left, address_current);
+    return find_account_or_neighbor_or_error((struct Tree_node*)node->left, address_current, depth+1);
   }
   else {
     if (node->node_type == 2){
       #if DEBUG
         printf("error, can't recurse right into hash\n");
       #endif
+      //if (depth>10)
+      //  printf("depth %u\n",depth);
       return NULL;
     }
     #if DEBUG
       printf("recurse right %i\n",nextbit);
     #endif
-    return find_account_or_neighbor_or_error((struct Tree_node*)node->right, address_current);
+    return find_account_or_neighbor_or_error((struct Tree_node*)node->right, address_current,depth+1);
   }
 }
 
@@ -506,7 +521,9 @@ struct Tree_node* insert_leaf(struct Tree_node* neighbor, uint8_t* address, uint
   #endif
   // if tree is empty, insert this address and accountdata and return
   if (neighbor == NULL){
-    printf("inserting one\n");
+    #if DEBUG
+      printf("inserting one\n");
+    #endif
     struct Tree_node* new_leaf = (struct Tree_node*) malloc(sizeof(struct Tree_node));
     new_leaf->node_type = 0;
     new_leaf->left = address;
@@ -519,7 +536,9 @@ struct Tree_node* insert_leaf(struct Tree_node* neighbor, uint8_t* address, uint
   // get bit where address and edge_label diverge
   uint32_t i = bitcompare(address, neighbor->edge_label, neighbor->edge_label_startbitidx, neighbor->edge_label_len);
   uint32_t addybit = getbit(address,i);
-  if (debug) printf("i %i\n",i);
+  #if DEBUG
+    printf("i %i\n",i);
+  #endif
   // insert node
   struct Tree_node* new_interior_node = (struct Tree_node*) malloc(sizeof(struct Tree_node));
   new_interior_node->node_type = 3;
@@ -589,6 +608,8 @@ void update_accounts(uint8_t* to_address, uint8_t* from_address, uint8_t* to_dat
     return;     // error
   if (nonce != from_nonce)
     return;     // error
+  if (from_data == to_data)
+    return;     // error
   from_balance -= value;
   to_balance += value;
   nonce += 1;
@@ -657,7 +678,7 @@ void process_transactions(){
         return; // error
       }
       // find leaf for this account or the neighbor which it branches from if there is a new node
-      struct Tree_node* found_node = find_account_or_neighbor_or_error(node, to_address);
+      struct Tree_node* found_node = find_account_or_neighbor_or_error(node, to_address, 0);
       // if not a leaf, must insert leaf
       if (found_node->node_type!=0)
         found_node = insert_leaf(found_node, to_address, malloc(num_accountdata_bytes));
@@ -670,13 +691,15 @@ void process_transactions(){
       return; // error
     }
     // apply account updates
-    printf("done5\n");
     update_accounts(to_address, from_address, to_data, from_data, data);
-    printf("done6\n");
   }
 
 }
 
+
+
+
+//  4) Merkleize pre and post root
 
 /*
 This function does all of the merklization, in a single-pass, of both old and new root.
@@ -692,77 +715,217 @@ The hash output is put in indices to the left of this stack item, i.e. in its pa
 
 leftFlag is 1 if this function is called on the left child, and 0 if right.
 */
-/*
-void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag){
-  // compute the offset to put the resulting hash for this node
-  uint8_t* old_hash_output_ptr = hash_stack_ptr - (leftFlag?80:60);
-  uint8_t* new_hash_output_ptr = hash_stack_ptr - (leftFlag?40:20);
-  // if we are at a leaf, then hash it and return
-  if (depth == num_address_bits){
-    // fill buffer with address
-    memcpy(leaf_buffer,addresses,num_address_bytes);
-    //memcpy(leaf_buffer+num_address_bytes,balances_old,num_balance_bytes);
-    memcpy(leaf_buffer_balance,balances_old,num_balance_bytes);
-    blake2b( old_hash_output_ptr, num_hash_bytes, leaf_buffer, num_address_bytes+num_balance_bytes, NULL, 0 );
-    // fill buffer with new value, then hash
-    memcpy(leaf_buffer_balance,balances_new,num_balance_bytes);
-    blake2b( new_hash_output_ptr, num_hash_bytes, leaf_buffer, num_address_bytes+num_balance_bytes, NULL, 0 );
-    // increment pointers to next address and next balances
-    addresses += num_address_bytes;
-    balances_old += num_balance_bits/8;
-    balances_new += num_balance_bits/8;
+
+
+// globals related to merkelization, maybe could also pass as args
+uint32_t num_hash_block_bytes = 1024;
+uint32_t num_hash_state_bytes = 512;
+uint32_t hash_state = 0;
+uint32_t hash_inplace_flag = 0;
+uint32_t num_hashblock_bytes = 0;
+uint8_t* max_hashstack = NULL;
+uint32_t modifiable_subtree_idx = 0;
+
+void init_hash(){
+  num_hashblock_bytes = 2*num_hash_bytes+1;
+}
+
+void hash_(uint8_t* dst, uint8_t* src, uint32_t len){
+  #if DEBUG
+  printf("to be hashed ");
+  for(int i=0;i<len;i++){
+    printf("%02x",src[i]);
+  }
+  printf("\n");
+  #endif
+  //printf("%u\n",num_hash_bytes);
+  if (len==2*num_hash_bytes+1){
+    #if DEBUG
+    printf("ok1 %u %u\n",src[0],src[num_hash_bytes]);
+    #endif
+    dst[0] = src[0]+src[num_hash_bytes];
+  }
+  else{
+    #if DEBUG
+    printf("ok2 %u\n",src[num_address_bytes]);
+    #endif
+    dst[0] = src[num_address_bytes];
+  }
+}
+
+void merkleize_modifiable_subtree(uint8_t* hash_block, struct Tree_node* node, uint32_t recursion_depth){
+  #if DEBUG
+    printf("%*smerkleize_modifiable_subtree(%p, %p, %u)\n",recursion_depth,"",hash_block,node,recursion_depth);
+  #endif
+  if (max_hashstack <= hash_block){
+    #if DEBUG
+      printf("error: bad max_tree_depth");
+    #endif
     return;
   }
-  uint8_t opcode = *node_labels;
-  node_labels++;
-  uint8_t addy_chunk_bit_length, addy_chunk_byte_length;
-  switch (opcode){
-    case 0:
-      // get address chunk
-      addy_chunk_bit_length = *address_chunks;
-      addy_chunk_byte_length = (addy_chunk_bit_length+7)/8;
-      address_chunks += 1 + addy_chunk_byte_length;
-      // recurse with updated depth, same hash_stack_ptr and leftFlag
-      merkleize_new_and_old_root(depth+addy_chunk_bit_length, hash_stack_ptr, leftFlag);
-      break;
-    case 1:
-      // recurse on right
-      merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
-      // get hash from calldata, put in in both old and new left slots
-      memcpy(hash_stack_ptr,calldatahashes,num_hash_bytes);
-      memcpy(hash_stack_ptr+40,calldata_hashes,num_hash_bytes);
-      proof_hashes += num_hash_bytes;
-      // finally hash old and new
-      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
-      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
-      break;
-    case 2:
-      // recurse on left
-      merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
-      // get hash from calldata, put in in both old and new right slots
-      memcpy(hash_stack_ptr+20,proof_hashes,num_hash_bytes);
-      memcpy(hash_stack_ptr+20+40,proof_hashes,num_hash_bytes);
-      proof_hashes += num_hash_bytes;
-      // finally hash old and new
-      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
-      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
-      break;
-    case 3:
-      // recurse both left and right
-      merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
-      merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
-      // hash what was returned
-      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
-      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
-      break;
+  // zero workspace
+  for (int i=0; i<num_hashblock_bytes; i++)
+    hash_block[i] = 0;
+  uint32_t hash_len = num_hashblock_bytes;
+  #if DEBUG
+    printf("%*snode type: %u\n",recursion_depth,"",node->node_type);
+  #endif
+  if (node->node_type==0) { // # leaf
+    memcpy(hash_block, node->left, num_address_bytes);
+    memcpy(hash_block+num_address_bytes, node->right, num_accountdata_bytes);
+    hash_block[num_address_bytes+num_accountdata_bytes+1] = node->edge_label_len;
+    hash_len = num_address_bytes+num_accountdata_bytes+1;
   }
+  else if (node->node_type==1) {
+    memcpy(hash_block, node->left, num_hash_bytes);
+    merkleize_modifiable_subtree(hash_block+num_hashblock_bytes, (struct Tree_node*)node->right, recursion_depth+1);
+    memcpy(hash_block+num_hash_bytes, hash_block+num_hashblock_bytes, num_hash_bytes);
+    hash_block[2*num_hash_bytes+1] = node->edge_label_len;
+  }
+  else if (node->node_type == 2){
+    merkleize_modifiable_subtree(hash_block+num_hashblock_bytes, (struct Tree_node*)node->left, recursion_depth+1);
+    memcpy(hash_block, hash_block+num_hashblock_bytes, num_hash_bytes);
+    memcpy(hash_block+num_hash_bytes, node->right, num_hash_bytes);
+    hash_block[2*num_hash_bytes+1] = node->edge_label_len;
+  }
+  else if (node->node_type == 3){
+    merkleize_modifiable_subtree(hash_block+num_hashblock_bytes, (struct Tree_node*)node->left, recursion_depth+1);
+    memcpy(hash_block, hash_block+num_hashblock_bytes, num_hash_bytes);
+    merkleize_modifiable_subtree(hash_block+num_hashblock_bytes, (struct Tree_node*)node->right, recursion_depth+1);
+    memcpy(hash_block+num_hash_bytes, hash_block+num_hashblock_bytes, num_hash_bytes);
+    hash_block[2*num_hash_bytes+1] = node->edge_label_len;
+  }
+  hash_(hash_block, hash_block, hash_len);
 }
-*/
 
 
-void init_merkleization_and_merkleize(uint8_t* hash_block){
+void merkleize_pre_and_post(uint8_t* hash_block, uint32_t depth, uint32_t recursion_depth, uint32_t post_hash_flag){
+  #if DEBUG
+    printf("%*smerkleize_pre_and_post(%p, %u, %u, %u)\n",recursion_depth,"",hash_block,depth,recursion_depth,post_hash_flag);
+  #endif
+  uint32_t num_workspace_bytes = num_hashblock_bytes + post_hash_flag*num_hashblock_bytes;
+  if (max_hashstack <= hash_block){
+    #if DEBUG
+      printf("%*serror: bad max_tree_depth\n",recursion_depth,"");
+    #endif
+    return;
+  }
+  // zero it out
+  for (int i=0; i<num_workspace_bytes; i++)
+    hash_block[i]=0;
+  uint32_t hash_len = num_hashblock_bytes;
+  uint8_t edge_label_len = 0;
+  if (node_label_currentidx == next_modified_subtree_node_label_idx){
+    post_hash_flag = 0;
+    struct Tree_node* node = (struct Tree_node*) (modified_subtrees + modifiable_subtree_idx*sizeof(struct Tree_node));
+    merkleize_modifiable_subtree(hash_block+num_hashblock_bytes, node, recursion_depth);
+    // set up for next modifiable subtree
+    modifiable_subtree_idx+=1;
+    get_next_modified_subtree_node_label_idx();
+  }
+  uint8_t node_label = get_next_node_label_bitpair();
+  if (node_label == 0){
+    if (depth==num_address_bits) { // leaf with no edge label, this is rare
+      // put address, prestate accountdata, and edge_label_len=0
+      memcpy(hash_block, addresses_start+account_idx*num_address_bytes,num_address_bytes);
+      memcpy(hash_block+num_address_bytes, accountdatas_start+account_idx*num_accountdata_bytes,num_accountdata_bytes);
+      if (post_hash_flag==1){
+        memcpy(hash_block+num_hashblock_bytes, addresses_start+account_idx*num_address_bytes,num_address_bytes);
+        memcpy(hash_block+num_hashblock_bytes+num_address_bytes, post_accountdatas_start+account_idx*num_accountdata_bytes,num_accountdata_bytes);
+      }
+      account_idx = get_next_account_idx();
+      hash_len = num_address_bytes+num_accountdata_bytes+1;
+    }
+    else {
+      edge_label_len = get_next_edge_label_length();
+      depth += edge_label_len;
+      if (depth==num_address_bits) { // a leaf with an edge label
+        memcpy(hash_block, addresses_start+account_idx*num_address_bytes,num_address_bytes);
+        memcpy(hash_block+num_address_bytes, accountdatas_start+account_idx*num_accountdata_bytes,num_accountdata_bytes);
+        hash_block[num_address_bytes+num_accountdata_bytes+1] = edge_label_len;
+        if (post_hash_flag==1){
+          // put address, poststate accountdata, and edge_label_len=0
+          memcpy(hash_block+num_hashblock_bytes, addresses_start+account_idx*num_address_bytes,num_address_bytes);
+          memcpy(hash_block+num_hashblock_bytes+num_address_bytes, post_accountdatas_start+account_idx*num_accountdata_bytes,num_accountdata_bytes);
+          hash_block[num_hashblock_bytes+num_address_bytes+num_accountdata_bytes+1] = edge_label_len;
+	}
+        account_idx = get_next_account_idx();
+        hash_len = num_address_bytes+num_accountdata_bytes+1;
+      }
+      else { // not a leaf, get next node label and process it below
+        node_label = get_next_node_label_bitpair();
+      }
+    }
+  }
+  if (node_label == 1){
+    // get left witness hash for prestate
+    uint8_t* left_hash = get_next_hash();
+    memcpy(hash_block, left_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes, left_hash, num_hash_bytes);
+    // compute and get right hash
+    uint8_t* right_hash = hash_block+num_workspace_bytes;
+    merkleize_pre_and_post(right_hash, depth+1, recursion_depth+1, post_hash_flag);
+    memcpy(hash_block+num_hash_bytes, right_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes+num_hash_bytes, right_hash+num_hashblock_bytes, num_hash_bytes);
+  }
+  else if (node_label == 2){
+    // compute and get left hash
+    uint8_t* left_hash = hash_block+num_workspace_bytes;
+    merkleize_pre_and_post(left_hash, depth+1, recursion_depth+1, post_hash_flag);
+    memcpy(hash_block, left_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes, left_hash+num_hashblock_bytes, num_hash_bytes);
+    // get right witness hash for prestate
+    uint8_t* right_hash = get_next_hash();
+    memcpy(hash_block+num_hash_bytes, right_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes+num_hash_bytes, right_hash, num_hash_bytes);
+  }
+  else if (node_label == 3){
+    // compute and get left hash
+    uint8_t* left_hash = hash_block+num_workspace_bytes;
+    merkleize_pre_and_post(left_hash,depth+1,recursion_depth+1,post_hash_flag);
+    memcpy(hash_block, left_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes, left_hash+num_hashblock_bytes, num_hash_bytes);
+    // compute and get right hash
+    uint8_t* right_hash = hash_block+num_workspace_bytes;
+    merkleize_pre_and_post(right_hash, depth+1, recursion_depth+1, post_hash_flag);
+    memcpy(hash_block+num_hash_bytes, right_hash, num_hash_bytes);
+    if (post_hash_flag==1)
+      memcpy(hash_block+num_hashblock_bytes+num_hash_bytes, right_hash+num_hashblock_bytes, num_hash_bytes);
+  }
+  hash_(hash_block, hash_block, hash_len);
+  if (post_hash_flag==1)
+    hash_(hash_block+num_hashblock_bytes, hash_block+num_hashblock_bytes, hash_len);
+}
+
+
+uint8_t* init_merkleization_and_merkleize(){
+
+  // init traversal values to the beginning
+  node_label_currentidx = 0;
+  edge_label_length_current = edge_label_lengths_start;
+  hash_current = calldata_hashes_start;
+  address_current = addresses_start;
+  accountdata_current = accountdatas_start;
+  modified_subtree_idx_current = modified_subtree_idxs_start;
+  get_next_modified_subtree_node_label_idx();
+  init_hash();
+  // other globals
+  modifiable_subtree_idx = 0;
+  account_idx = 0;
+  // init stack
+  uint8_t* stack = malloc((max_tree_depth+1)*num_hashblock_bytes);
+  max_hashstack = stack+(max_tree_depth+1)*2*num_hashblock_bytes;
+  // finally, compute new and old hashes
+  merkleize_pre_and_post(stack,0,0,1);
+  return stack;
 
 }
+
 
 
 
@@ -775,12 +938,13 @@ void print_tree(struct Tree_node* node, int indent);
 #endif
 
 
+// merkle roots, 32 bytes each
+uint8_t pre_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+uint8_t post_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+uint8_t calldata_[] = {0x6,0x3,0x0,0xe2,0x30,0x40,0x5,0x0,0x1,0xfc,0xfe,0x1,0xfc,0x0,0x0,0xb,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x60,0x0,0x0,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x60,0x0,0x20,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xa0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xf0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x18,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x5,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xd4,0x0,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xf0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0};
+
 #if WASM
 #else
-uint8_t calldata_[] = {0x3,0x0,0xe2,0x30,0x40,0x5,0x0,0x1,0xfb,0xfd,0x1,0xfb,0x0,0x0,0xb,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x3c,0x0,0x0,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x60,0x0,0x20,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xa0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xf0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x18,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x5,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xd4,0x0,0x0,0x2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xf0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x3,0x0,0x0,0x0,0x0,0x0,0x0,0x0};
-// merkle roots, 32 bytes each
-uint8_t post_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-uint8_t pre_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 // Dummy functions for testing
 uint32_t eth2_blockDataSize(){
   return sizeof(calldata_) / sizeof(calldata_[0]);
@@ -788,28 +952,34 @@ uint32_t eth2_blockDataSize(){
 void eth2_blockDataCopy(uint32_t* dst, uint32_t start, uint32_t len){
   memcpy(dst, calldata_+start, len);
 }
+uint32_t eth2_loadPreStateRoot(uint32_t* dst){
+  memcpy(dst, pre_state_root, num_hash_bytes);
+}
 #endif
 
 
 
 
+int _main(void){
 
-void _main(void){
-
-  uint32_t calldata_size = eth2_blockDataSize();
-  uint8_t* calldata = (uint8_t*) malloc( calldata_size );
-  eth2_blockDataCopy( (uint32_t*)calldata, 0, calldata_size  );
+  //uint32_t calldata_size = eth2_blockDataSize();
+  uint32_t calldata_size = sizeof(calldata_);
+  uint8_t* calldata = calldata_;
+  //uint8_t* calldata = (uint8_t*) malloc( calldata_size );
+  //eth2_blockDataCopy( (uint32_t*)calldata, 0, calldata_size  );
 
   init_num_bytes_and_bits();
 
-  printf("calldata %p\n",calldata);
+  //printf("calldata %p\n",calldata);
 
   // get calldata
-  if (calldata_size == 0)
-    return; // error, revert
+  //if (calldata_size == 0)
+  //  return; // error, revert
 
   // 0) decode calldata
-  if (debug) printf("0) decode calldata\n");
+  #if DEBUG
+    printf("0) decode calldata\n");
+  #endif
   decode_calldata(calldata);
   #if DEBUG
     printf("node_labels\t %p %i\n",node_labels_start, node_labels_bytelen);
@@ -835,7 +1005,6 @@ void _main(void){
   #endif
   num_modified_subtrees = modified_subtree_idxs_bytelen/11;
   build_modified_subtrees();
-  printf("ok\n");
   #if DEBUG
     for(int i=0; i<num_modified_subtrees; i++){
       printf("printing modified subtree %u\n",i);
@@ -882,37 +1051,31 @@ void _main(void){
   #if DEBUG
     printf("4) Merkleize pre and post root\n");
   #endif
-  uint8_t* hash_block = malloc(2*num_hashblock_bytes);
-  init_merkleization_and_merkleize(hash_block);
+  //uint8_t* hash_block = malloc(2*num_hashblock_bytes);
+  uint8_t* hash_block = init_merkleization_and_merkleize();
   #if DEBUG
     printf("preroot:");
-    for (int j=0; j<num_hashblock_bytes; j++)
+    for (int j=0; j<num_hash_bytes; j++)
       printf("%02x", hash_block[j]);
     printf("\n");
     printf("postroot:");
-    for (int j=num_hashblock_bytes; j<2*num_hashblock_bytes; j++)
+    for (int j=num_hashblock_bytes; j<num_hashblock_bytes+num_hash_bytes; j++)
       printf("%02x", hash_block[j]);
     printf("\n");
   #endif
 
 
-  /*
-  // finally, merkleize prestate and poststate
-  uint8_t* hash_stack_ptr = malloc(10000); // 10,000 bytes is bigger than needed for depth 50 tree
-  merkleize_new_and_old_root(0, hash_stack_ptr+80, 1);
-
-  // update hash, hash_stack_ptr+40 should correspond to new merkle root hash
-  for (int i=0; i<20; i++)
-    post_state_root[i] = hash_stack_ptr[40+i];
-
   // verify prestate against old merkle root hash
-  eth2_loadPreStateRoot((uint32_t*)pre_state_root);
+  //eth2_loadPreStateRoot((uint32_t*)pre_state_root);
   for (int i=0; i<num_hash_bytes; i++){
-    if (hash_stack_ptr[i] != pre_state_root[i]){
+    if (hash_block[i] != pre_state_root[i]){
     //  return; // error, revert
+      #if DEBUG
+        printf("error: prehashes different\n");
+      #endif
     }
   }
-  */
+  return hash_block[0];
 
 }
 
@@ -932,6 +1095,8 @@ void _main(void){
 
 
 
+#if WASM
+#else
 
 
 //////////////
@@ -970,7 +1135,7 @@ void print_tree_dot_recursive_helper(FILE* fp, struct Tree_node* node, int paren
       }
     }
     //fprintf(fp," %02x%02x%02x%02x", node->left[0], node->left[1],node->left[2],node->left[3]);
-    fprintf(fp,"\", color=lightblue, shape=box, style=filled];\n");
+    fprintf(fp,"\", color=blue, shape=box, style=filled];\n");
   }
   else if (node->node_type==1){
     fprintf(fp,"n%u [  label = \"01\"];\n", node_idx);
@@ -1010,6 +1175,10 @@ void print_tree_dot(struct Tree_node* node, int parent_idx, char* edge_label){
   fclose (fp);
 }
 
+
+
+
+
 void print_tree(struct Tree_node* node, int indent){
 
   printf("%*snode %p\n", indent, "", node);
@@ -1022,10 +1191,18 @@ void print_tree(struct Tree_node* node, int indent){
   }
   else if (node->node_type==2){
     //printf("recursing left\n");
+    printf("%*sright hash", indent, "");
+    for (int i=0;i<num_hash_bytes;i++)
+      printf("%02x", node->right[i]);
+    printf("\n");
     print_tree((struct Tree_node*)node->left, indent+1);
   }
   else if (node->node_type==1){
     //printf("recursing right\n");
+    printf("%*sleft hash", indent, "");
+    for (int i=0;i<num_hash_bytes;i++)
+      printf("%02x", node->left[i]);
+    printf("\n");
     print_tree((struct Tree_node*)node->right, indent+1);
   }
   else if (node->node_type==3){
@@ -1041,33 +1218,65 @@ void print_tree(struct Tree_node* node, int indent){
 
 //////////////////
 // test generation
+//
+#include "rand.h"
+pcg32_random_t rng;
 
+uint32_t rand_histogram[256];
 void get_random_bytes(uint8_t* dst, uint32_t num_bytes){
   //uint8_t* ret = (uint8_t*) malloc(num_bytes);
   //printf("\nget_random_bytes(%u) ",num_bytes);
-  for (int i=0; i<num_bytes; i++)
-    dst[i] = rand();
+  for (int i=0; i<num_bytes; i++){
+    //dst[i] = (random())%256;
+    dst[i] = pcg32_boundedrand_r(&rng, 256);
+    //dst[i] += rand()>>16;
+    rand_histogram[dst[i]]++;
+  }
   //for (int i=0; i<num_bytes; i++)
   //  printf("%02x", dst[i]);
   //printf("\n");
 }
 
+/* not needed, can get from traversal which accumulates labels
+uint8_t get_max_tree_depth(struct Tree_node* node, uint8_t depth){
+  if (node->node_type==0){
+    return depth;
+  }
+  if (node->node_type==2){
+    return get_max_tree_depth((struct Tree_node*)node->left, depth+1);
+  }
+  else if (node->node_type==1){
+    return get_max_tree_depth((struct Tree_node*)node->right, depth+1);
+  }
+  else if (node->node_type==3){
+    int depth_left = get_max_tree_depth((struct Tree_node*)node->left, depth+1);
+    int depth_right = get_max_tree_depth((struct Tree_node*)node->right, depth+1);
+    if (depth_right<depth_left)
+      return depth_left;
+    else
+      return depth_right;
+  }
+}
+*/
 
-struct Tree_node* test_generator(uint64_t num_accounts_in_witness, uint64_t num_accounts_in_state){
+
+struct Tree_node* tree_generator(uint64_t num_accounts_in_witness, uint64_t num_accounts_in_state){
   printf("#accts in witnes: %"PRIu64",  #accts in state: %"PRIu64"\n", num_accounts_in_witness, num_accounts_in_state);
 
   struct Tree_node* tree = NULL;
 
   srand(time(NULL));
+  srandom(time(NULL));
+  pcg32_srandom_r(&rng, time(NULL), 54u);
 
   // generate addresses in witness and build a tree with just them
   for (uint64_t i=0; i<num_accounts_in_witness; i++){
     if(debug) printf("i %"PRIu64"\n",i);
     uint8_t* address = malloc(num_address_bytes);
-    printf("calling get_random_bytes(%u) ", (int)num_address_bytes);
+    //printf("calling get_random_bytes(%u) ", (int)num_address_bytes);
     get_random_bytes(address, num_address_bytes);
     uint8_t* data = (uint8_t*) malloc(num_accountdata_bytes);
-    struct Tree_node* found_node = find_account_or_neighbor_or_error(tree, address);
+    struct Tree_node* found_node = find_account_or_neighbor_or_error(tree, address, 0);
     if (!found_node){
       if (debug) printf("tree was empty");
       tree = insert_leaf(NULL, address, data);
@@ -1079,9 +1288,15 @@ struct Tree_node* test_generator(uint64_t num_accounts_in_witness, uint64_t num_
     while (tree->parent)
       tree = tree->parent;
   }
-  printf("\n\n tree before insertions\n");
-  print_tree(tree,0);
-  print_tree_dot(tree,0,"");
+  uint32_t rand_histogram_sum = 0;
+  for (int i=0;i<256;i++){
+    printf("%u %u\n",i,rand_histogram[i]);
+    rand_histogram_sum += rand_histogram[i];
+  }
+  printf("rand_histogram_sum %u\n", rand_histogram_sum);
+  //printf("\n\n tree before insertions\n");
+  //print_tree(tree,0);
+  //print_tree_dot(tree,0,"");
 
   // generate remaining state and insert into tree as dummy hashes
   uint8_t* data = (uint8_t*) malloc(num_accountdata_bytes);
@@ -1090,7 +1305,7 @@ struct Tree_node* test_generator(uint64_t num_accounts_in_witness, uint64_t num_
     if(debug) printf("j %"PRIu64"\n",i);
     if(i%1000000==0) printf("j %"PRIu64"\n",i);
     get_random_bytes(address, num_address_bytes);
-    struct Tree_node* found_node = find_account_or_neighbor_or_error(tree, address);
+    struct Tree_node* found_node = find_account_or_neighbor_or_error(tree, address, 0);
     if (!found_node){
       //printf("found node NULL: %p",found_node);
     }
@@ -1123,12 +1338,296 @@ struct Tree_node* test_generator(uint64_t num_accounts_in_witness, uint64_t num_
     //print_tree(tree,0);
     
   }
+  for (int i=0;i<256;i++){
+    printf("%u %u\n",i,rand_histogram[i]);
+    rand_histogram_sum += rand_histogram[i];
+  }
+  printf("rand_histogram_sum %u\n", rand_histogram_sum);
 
   //printf("\n\nfinal tree\n");
   //print_tree(tree,0);
   print_tree_dot(tree,0,"");
 
   return tree;
+}
+
+
+
+
+
+struct bytes {
+  uint8_t* startptr;
+  uint8_t* ptr;
+  uint32_t len;
+};
+
+struct bytes* node_labels_bytes_naive = NULL;
+struct bytes* node_labels_bytes = NULL;
+struct bytes* edge_label_lens_bytes = NULL;
+struct bytes* edge_labels_bytes = NULL;
+struct bytes* addresses_bytes = NULL;
+struct bytes* accountdata_bytes = NULL;
+struct bytes* hashes_bytes = NULL;
+
+
+
+
+void tree2calldata_recursive_helper(struct Tree_node* node, uint32_t depth, uint32_t recursion_depth){
+  if (max_tree_depth<recursion_depth)
+    max_tree_depth = recursion_depth;
+  // if leaf
+  if (node->node_type == 0){
+    node_labels_bytes_naive->ptr[0] = 0; node_labels_bytes_naive->ptr++;
+    if (node->edge_label_len != 0){
+      edge_label_lens_bytes->ptr[0] = node->edge_label_len; edge_label_lens_bytes->ptr++;
+    }
+    memcpy(addresses_bytes->ptr, node->left, num_address_bytes); addresses_bytes->ptr+=num_address_bytes;
+    memcpy(accountdata_bytes->ptr, node->right, num_accountdata_bytes); accountdata_bytes->ptr+=num_accountdata_bytes;
+    return;
+  }
+  // if edge label, not leaf
+  if (node->edge_label_len){
+    node_labels_bytes_naive->ptr[0] = 0; node_labels_bytes_naive->ptr++;
+    edge_label_lens_bytes->ptr[0] = node->edge_label_len; edge_label_lens_bytes->ptr++;
+    depth += node->edge_label_len;
+  }
+  // Node type. note: not a leaf and edge label, if any, already handled above
+  if (node->node_type == 1){
+    node_labels_bytes_naive->ptr[0] = 1; node_labels_bytes_naive->ptr++;
+    tree2calldata_recursive_helper((struct Tree_node*)node->right, depth+1, recursion_depth+1);
+    memcpy(hashes_bytes->ptr, node->left, num_hash_bytes); hashes_bytes->ptr+=num_hash_bytes;
+  }
+  else if (node->node_type == 2){
+    node_labels_bytes_naive->ptr[0] = 2; node_labels_bytes_naive->ptr++;
+    tree2calldata_recursive_helper((struct Tree_node*)node->left, depth+1, recursion_depth+1);
+    memcpy(hashes_bytes->ptr, node->right, num_hash_bytes); hashes_bytes->ptr+=num_hash_bytes;
+  }
+  else if (node->node_type == 3){
+    node_labels_bytes_naive->ptr[0] = 3; node_labels_bytes_naive->ptr++;
+    tree2calldata_recursive_helper((struct Tree_node*)node->left, depth+1, recursion_depth+1);
+    tree2calldata_recursive_helper((struct Tree_node*)node->right, depth+1, recursion_depth+1);
+  }
+
+}
+
+
+uint32_t overestimate_bytes_len = 10000000; // for similicity, 1MB, make bigger if your witness may be bigger
+
+void tree2calldata(struct Tree_node* root){
+
+  node_labels_bytes_naive = (struct bytes*) malloc(sizeof(struct bytes));
+  node_labels_bytes_naive->len = overestimate_bytes_len;
+  node_labels_bytes_naive->startptr = (uint8_t*) malloc(node_labels_bytes_naive->len);
+  node_labels_bytes_naive->ptr = node_labels_bytes_naive->startptr;
+
+  edge_label_lens_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  edge_label_lens_bytes->len = overestimate_bytes_len;
+  edge_label_lens_bytes->startptr = (uint8_t*) malloc(edge_label_lens_bytes->len);
+  edge_label_lens_bytes->ptr = edge_label_lens_bytes->startptr;
+
+  addresses_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  addresses_bytes->len = overestimate_bytes_len;
+  addresses_bytes->startptr = (uint8_t*) malloc(addresses_bytes->len);
+  addresses_bytes->ptr = addresses_bytes->startptr;
+
+  accountdata_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  accountdata_bytes->len = overestimate_bytes_len;
+  accountdata_bytes->startptr = (uint8_t*) malloc(accountdata_bytes->len);
+  accountdata_bytes->ptr = accountdata_bytes->startptr;
+
+  hashes_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  hashes_bytes->len = overestimate_bytes_len;
+  hashes_bytes->startptr = (uint8_t*) malloc(hashes_bytes->len);
+  hashes_bytes->ptr = hashes_bytes->startptr;
+
+  // start traversal
+  tree2calldata_recursive_helper(root,0,0);
+
+  // fix byte arrays
+  node_labels_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  node_labels_bytes->len = overestimate_bytes_len;
+  node_labels_bytes->startptr = (uint8_t*) malloc(node_labels_bytes->len);
+  node_labels_bytes->ptr = node_labels_bytes->startptr;
+  uint32_t num_node_label_bitpairs = node_labels_bytes_naive->ptr - node_labels_bytes_naive->startptr;
+  for (int i=0; i<num_node_label_bitpairs/4+(num_node_label_bitpairs%4)>0?1:0; i++){
+    uint8_t byte1 = node_labels_bytes_naive->ptr[0];
+    uint8_t byte2 = node_labels_bytes_naive->ptr[1];
+    uint8_t byte3 = node_labels_bytes_naive->ptr[2];
+    uint8_t byte4 = node_labels_bytes_naive->ptr[3];
+    *node_labels_bytes->ptr = (byte1<<6) | (byte2<<4) | (byte3<<2) | byte4;
+    node_labels_bytes_naive->ptr+=4;
+    node_labels_bytes->ptr++;
+  }
+
+}
+
+
+
+
+
+
+
+struct bytes* generate_calldata(uint64_t num_accounts_in_witness, uint64_t num_accounts_in_state, uint64_t num_transactions_to_existing, uint64_t num_transactions_to_new){
+
+  // generate tree
+  struct Tree_node* tree = tree_generator(num_accounts_in_witness, num_accounts_in_state);
+
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+  printf("OK\n");
+
+  // traverse tree collecting bytes of witness
+  tree2calldata(tree);
+
+  // generate transactions
+  struct bytes* transactions_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  transactions_bytes->len = 0;
+  transactions_bytes->startptr = (uint8_t*) malloc(transactions_bytes->len);
+  transactions_bytes->ptr = transactions_bytes->startptr;
+  for (int i=0; i<num_transactions_to_existing; i++){
+    uint8_t from_addy_idx = i%num_transactions_to_existing; //random.randint(0,num_accounts_in_witness-1)
+    uint8_t to_addy_idx = (i+1)%num_transactions_to_existing; //random.randint(0,num_accounts_in_witness-1)
+    uint64_t from_nonce = i/num_transactions_to_existing;
+    uint64_t amount = 1;
+    uint64_t accountdata = amount | (from_nonce<<48);
+    transactions_bytes->ptr[0] = from_addy_idx;
+    transactions_bytes->ptr[1] = to_addy_idx;
+    transactions_bytes->ptr+=2;
+    // TODO: signature, empty for now
+    transactions_bytes->ptr+=num_signature_bytes;
+    memcpy(transactions_bytes->ptr,addresses_bytes->startptr+to_addy_idx*num_address_bytes,num_address_bytes);
+    transactions_bytes->ptr+=num_address_bytes;
+    *(uint64_t*)transactions_bytes->ptr = accountdata;
+    transactions_bytes->ptr+=num_accountdata_bytes;
+  }
+
+
+  // modified subtrees
+  struct bytes* modified_subtree_idxs_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  modified_subtree_idxs_bytes->len = 0;
+  modified_subtree_idxs_bytes->startptr = (uint8_t*) malloc(modified_subtree_idxs_bytes->len);
+  modified_subtree_idxs_bytes->ptr = modified_subtree_idxs_bytes->startptr;
+
+
+  // edge labels aren't computed by tree2calldata(), should be empty
+  edge_labels_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  edge_labels_bytes->len = 0;
+  edge_labels_bytes->startptr = (uint8_t*) malloc(edge_labels_bytes->len);
+  edge_labels_bytes->ptr = edge_labels_bytes->startptr;
+
+
+
+  uint32_t calldata_bytelen = (node_labels_bytes->ptr - node_labels_bytes->startptr) +
+                              (edge_label_lens_bytes->ptr - edge_label_lens_bytes->startptr) +
+                              (edge_labels_bytes->ptr - edge_labels_bytes->startptr) +
+                              (modified_subtree_idxs_bytes->ptr - modified_subtree_idxs_bytes->startptr) +
+                              (hashes_bytes->ptr - hashes_bytes->startptr) +
+                              (addresses_bytes->ptr - addresses_bytes->startptr) +
+                              (accountdata_bytes->ptr - accountdata_bytes->startptr) +
+                              (transactions_bytes->ptr - transactions_bytes->startptr);
+  struct bytes* calldata_bytes = (struct bytes*) malloc(sizeof(struct bytes));
+  calldata_bytes->len = calldata_bytelen;
+  calldata_bytes->startptr = (uint8_t*) malloc(calldata_bytes->len);
+  calldata_bytes->ptr = calldata_bytes->startptr;
+
+  int len = 1;
+  calldata_bytes->ptr[0] = max_tree_depth;
+  calldata_bytes->ptr+=len;
+
+  len = node_labels_bytes->ptr - node_labels_bytes->startptr;
+  printf("node_labels_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr+2, node_labels_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = edge_label_lens_bytes->ptr - edge_label_lens_bytes->startptr;
+  printf("edge_label_lens_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr+2, edge_label_lens_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = edge_labels_bytes->ptr - edge_labels_bytes->startptr;
+  printf("edge_labels_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr, edge_labels_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = modified_subtree_idxs_bytes->ptr - modified_subtree_idxs_bytes->startptr;
+  printf("modified_subtree_idxs_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr, modified_subtree_idxs_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = hashes_bytes->ptr - hashes_bytes->startptr;
+  printf("hashes_bytes len %u\n", len);
+  *(uint32_t*)calldata_bytes->ptr = (uint32_t)len;
+  memcpy(calldata_bytes->ptr, hashes_bytes->ptr, len);
+  calldata_bytes->ptr+=4+len;
+
+  len = addresses_bytes->ptr - addresses_bytes->startptr;
+  printf("addresses_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr, addresses_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = accountdata_bytes->ptr - accountdata_bytes->startptr;
+  printf("accountdata_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr, accountdata_bytes->ptr, len);
+  calldata_bytes->ptr+=2+len;
+
+  len = transactions_bytes->ptr - transactions_bytes->startptr;
+  printf("transactions_bytes len %u\n", len);
+  *(uint16_t*)calldata_bytes->ptr = (uint16_t)len;
+  memcpy(calldata_bytes->ptr, transactions_bytes->ptr, len);
+  //calldata_bytes->ptr+=2+len;
+
+
+  free(node_labels_bytes_naive->startptr);
+  free(edge_label_lens_bytes->startptr);
+  free(edge_labels_bytes->startptr);
+  free(modified_subtree_idxs_bytes->startptr);
+  free(hashes_bytes->startptr);
+  free(addresses_bytes->startptr);
+  free(accountdata_bytes->startptr);
+  free(transactions_bytes->startptr);
+
+
+  free(node_labels_bytes_naive);
+  free(edge_label_lens_bytes);
+  free(edge_labels_bytes);
+  free(modified_subtree_idxs_bytes);
+  free(addresses_bytes);
+  free(accountdata_bytes);
+  free(hashes_bytes);
+  free(transactions_bytes);
+
+  return calldata_bytes;
+
+}
+
+
+void generate_scout_test(uint64_t num_accounts_in_witness, uint64_t num_accounts_in_state, uint64_t num_transactions_to_existing, uint64_t num_transactions_to_new){
+
+  FILE * fp;
+
+  fp = fopen ("scout_test.txt","w");
+  fprintf (fp, "blah\n");
+
+  // randomly generate calldata
+  struct bytes* calldata_bytes = generate_calldata(num_accounts_in_witness, num_accounts_in_state, num_transactions_to_existing, num_transactions_to_new);
+  // print calldata
+  for (int i=0; i<calldata_bytes->len; i++)
+    fprintf(fp,"%02x",calldata_bytes->ptr[i]);
+
+  fprintf (fp, "blah\n");
+  fclose (fp);
+
 }
 
 
@@ -1148,21 +1647,29 @@ void test_get_bit(){
   }
 }
 */
+#endif
 
 
 #if WASM
 #else
 int main(int argc, char** argv){
 
-  //uint8_t* calldata = (uint8_t*) malloc( calldata_size );
   init_num_bytes_and_bits();
 
-  _main();
-  //struct Tree_node* test_witness = test_generator(1, 1000000000);
+  //_main();
+
+  //struct Tree_node* test_witness = tree_generator(1, 1000000000);
+
   //test_get_bit();
 
+  uint64_t num_accounts_in_witness = 1;
+  uint64_t num_accounts_in_state = 80000000; //(uint64_t)1<<30;
+  uint64_t num_transactions_to_existing = 0;
+  uint64_t num_transactions_to_new = 0;
+  struct bytes* calldata_bytes = generate_calldata(num_accounts_in_witness, num_accounts_in_state, num_transactions_to_existing, num_transactions_to_new);
+  printf("calldata len: %i\n",calldata_bytes->len);
+
   return 0;
+
 }
 #endif
-
-
